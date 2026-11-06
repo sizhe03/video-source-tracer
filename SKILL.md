@@ -35,8 +35,9 @@ archive pages, name matching) cannot prove authorship, so attribution is
 always delivered as a lead for a human to confirm. `strong_lead` means a
 verified channel catalogue or several independent uploaders agree; `guess`
 means the only name came from a hedged comment. `ids` holds channel/handle
-identifiers that were positively verified; `pending_queries` lists web
-searches still worth running.
+identifier leads from string evidence, marked `status=lead_from_string_evidence` with a `confirm_by` hint for a
+human to open the channel; `pending_queries` lists web searches still
+worth running.
 
 `discover.py` remains available for a narrower job -- same-platform copies,
 comments, cross-platform search and cover hashing only. It does not do
