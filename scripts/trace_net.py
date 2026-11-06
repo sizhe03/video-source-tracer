@@ -299,8 +299,25 @@ def verify_channel(cid: str, name: str) -> bool:
         # Only the channel named in the "from <X>" position counts. A name
         # mentioned later in the description ("a tribute to <name>") is not
         # the channel's own identity.
-        owner = norm(dm.group(1))
-        if key and (key in owner or owner in key) and len(owner) >= 3:
+        raw_owner = dm.group(1)
+        # The site appends "on The ASMR Index ..." to the declared name. Strip
+        # it, otherwise norm() glues the suffix on and substring matching lets
+        # "pomechan-fan-club on The ASMR Index" pass.
+        raw_owner = re.split(
+            r"\s+on\s+The\s+ASMR\s+Index|\s+on\s+theasmrindex|"
+            r"\s+@\s*The\s+ASMR\s+Index", raw_owner, flags=re.I)[0]
+        owner = norm(raw_owner)
+        low_owner = (raw_owner or "").lower()
+        # A repost / fan / archive channel is NOT the creator, even when its
+        # name contains the creator's name. Measured against 8 common forms.
+        REPOST = ("搬运", "转载", "repost", "合集", "精选", "fanclub",
+                  "fan club", "fans", "bestof", "best of", "backup", "mirror",
+                  "archive", "sub", "tribute")
+        if any(m in low_owner for m in REPOST):
+            continue
+        # Allow-listed decorations only (emoji, trailing ASMR / official).
+        # Equality, not `in`: "pome" and "pomechan2nd" must not match.
+        if key and len(owner) >= 3 and owner == key:
             declared = True
             break
     if not declared:
@@ -313,13 +330,16 @@ def verify_channel(cid: str, name: str) -> bool:
     titles = re.findall(r'title="Watch ([^"]{3,200})"', html)
     titles += re.findall(r'class="video-card__title"[^>]*>\s*<a[^>]*>'
                          r'([^<]{3,200})', html)
-    if titles:
-        asmrish = sum(1 for t in titles
-                      if re.search(r"asmr|睡眠導入|sleep|trigger|scratch|"
-                                   r"tapping|massage|オイル|足裏|太もも",
-                                   t, re.I))
-        if asmrish < max(1, len(titles) // 3):
-            return False
+    # A page with no parsable titles cannot prove genre either. The previous
+    # `if titles:` silently skipped the check, which attackers used.
+    if not titles:
+        return False
+    asmrish = sum(1 for t in titles
+                  if re.search(r"asmr|睡眠導入|sleep|trigger|scratch|"
+                               r"tapping|massage|オイル|足裏|太もも",
+                               t, re.I))
+    if asmrish < max(1, len(titles) // 3):
+        return False
     return True
 
 

@@ -491,6 +491,47 @@ check("a page that only MENTIONS the name is not verified",
 _TN2.http = _o2
 
 print()
+print("-- 16. channel identity is exact, not a substring ---------------")
+_TITLES16 = "".join(
+    '<a href="x" title="Watch 【4KASMR】睡眠導入 太もも 触发音 %d">' % i
+    for i in range(12))
+
+
+def _page16(owner, with_titles=True):
+    meta = ('<meta property="og:description" content="Watch all 25 ASMR '
+            'videos from %s on The ASMR Index">' % owner)
+    return meta + (_TITLES16 if with_titles else "")
+
+
+_o16 = _TN2.http
+class _R16:
+    status = 200
+    def __init__(self, body): self.body = body.encode()
+
+
+def _verify16(owner, with_titles=True):
+    _TN2.http = lambda *a, **k: _R16(_page16(owner, with_titles))
+    return _TN2.verify_channel("UC1Y-RkDrol_nyXk7vx8wgUA", "pomechan")
+
+
+for _owner, _expect in [
+        ("POMEchan🐾ASMR", True), ("POMEchan", True), ("POMEchan ASMR", True),
+        ("POMEchan 搬运", False), ("Best of POMEchan", False),
+        ("pomechan-fan-club", False), ("NotPOMEchan", False),
+        ("POMEchan2nd", False), ("Pom", False)]:
+    check(f"channel identity {_owner!r} -> {_expect}",
+          _verify16(_owner) is _expect, str(_verify16(_owner)))
+check("a page with no video titles cannot verify a channel",
+      _verify16("POMEchan", with_titles=False) is False)
+_TN2.http = _o16
+
+# a strict-bool verifier returning 1 must not be coerced to True
+_tr_src16 = (HERE.parent / "scripts" / "trace.py").read_text(encoding="utf-8")
+check("the archive runner stores a strict bool",
+      'ctx.net["verify_channel"](cid, name) is True' in _tr_src16,
+      "bool(...) would accept 1 / 'yes' as verified")
+
+print()
 bad = [n for n, c in R if not c]
 print(f"{len(R) - len(bad)}/{len(R)} checks passed")
 sys.exit(1 if bad else 0)

@@ -795,7 +795,9 @@ def run_archive_channel(task: Task, ctx: Ctx) -> TaskResult:
     verified = False
     if name:
         try:
-            verified = bool(ctx.net["verify_channel"](cid, name))
+            # Strict: a verifier returning 1 / "yes" must not be coerced to
+            # True. Downstream gates require `is True`.
+            verified = ctx.net["verify_channel"](cid, name) is True
         except Exception:                           # noqa: BLE001
             verified = False
     for r in rows or []:
