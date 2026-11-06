@@ -268,8 +268,21 @@ class Ledger:
                     # the uploader). Keeping only the first writer is how the
                     # per-account signal went missing.
                     for k, v in c.items():
-                        if v not in (None, "", 0) and cur.get(k) in (None, "", 0):
+                        # `False == 0` in Python. Using a falsy test here
+                        # discarded an explicit channel_verified=False, so a
+                        # later verified row from a DIFFERENT channel could
+                        # overwrite it while keeping the rejected channel's id.
+                        # Only fill a field that is genuinely absent.
+                        if v is not None and v != "" and k not in cur:
                             cur[k] = v
+                    # Channel identity is atomic: it must never be assembled
+                    # from two different channels sharing the same video id.
+                    if cur.get("channel_id") != c.get("channel_id"):
+                        if cur.get("channel_id") is None:
+                            cur["channel_id"] = c.get("channel_id")
+                        elif c.get("channel_id") is not None:
+                            cur["channel_verified"] = False
+                            cur["archive_of"] = None
                 if task.origin:
                     self.edges.append(dict(task.origin))
                     cur["edges"].append(task.origin)

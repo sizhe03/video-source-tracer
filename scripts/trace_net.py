@@ -307,17 +307,23 @@ def verify_channel(cid: str, name: str) -> bool:
             r"\s+on\s+The\s+ASMR\s+Index|\s+on\s+theasmrindex|"
             r"\s+@\s*The\s+ASMR\s+Index", raw_owner, flags=re.I)[0]
         owner = norm(raw_owner)
-        low_owner = (raw_owner or "").lower()
-        # A repost / fan / archive channel is NOT the creator, even when its
-        # name contains the creator's name. Measured against 8 common forms.
-        REPOST = ("搬运", "转载", "repost", "合集", "精选", "fanclub",
-                  "fan club", "fans", "bestof", "best of", "backup", "mirror",
-                  "archive", "sub", "tribute")
-        if any(m in low_owner for m in REPOST):
+        low_raw = (raw_owner or "").lower()
+        # A repost / fan / archive channel is NOT the creator. Match on BOTH
+        # the raw string (for CJK markers) and the NORMALISED string: the raw
+        # form "pomechan-fan-club" hides "fanclub" behind a hyphen, while norm
+        # yields "pomechanfanclub" where it is visible. Reviewers reproduced a
+        # confirmed + wrong channel id through exactly this gap.
+        REPOST = ("搬运", "搬運", "转载", "轉載", "repost", "合集", "精选",
+                  "精選", "fanclub", "fanclub", "fan club", "fans", "bestof",
+                  "best of", "backup", "mirror", "archive", "tribute", "sub",
+                  "cover", "compilation")
+        if any(m in low_raw for m in REPOST):
             continue
-        # Allow-listed decorations only (emoji, trailing ASMR / official).
-        # Equality, not `in`: "pome" and "pomechan2nd" must not match.
-        if key and len(owner) >= 3 and owner == key:
+        if any(m in owner for m in REPOST):
+            continue
+        # A 3-character abbreviation ("pom") is too weak to verify identity.
+        # Require >= 4 normalised chars, then compare EXACTLY.
+        if key and len(key) >= 4 and len(owner) >= 3 and owner == key:
             declared = True
             break
     if not declared:

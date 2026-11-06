@@ -532,6 +532,56 @@ check("the archive runner stores a strict bool",
       "bool(...) would accept 1 / 'yes' as verified")
 
 print()
+print("-- 17. round-6: hyphenated repost names + falsy merge ------------")
+_T17 = "".join('<a href="x" title="Watch 【4KASMR】睡眠導入 太もも %d">' % i
+               for i in range(12))
+
+
+def _pg17(owner):
+    return ('<meta property="og:description" content="Watch all 25 ASMR '
+            'videos from %s on The ASMR Index">' % owner) + _T17
+
+
+_o17 = _TN2.http
+class _R17:
+    status = 200
+    def __init__(self, body): self.body = body.encode()
+
+
+def _v17(owner):
+    _TN2.http = lambda *a, **k: _R17(_pg17(owner))
+    return _TN2.verify_channel("UC1Y-RkDrol_nyXk7vx8wgUA", "pomechan")
+
+
+for _o17, _exp in [("POMEchan🐾ASMR", True), ("POMEchan", True),
+                   ("POMEchan ASMR", True), ("pomechan-fan-club", False),
+                   ("Best-of-POMEchan", False), ("Pom", False),
+                   ("POMEchan2nd", False), ("POMEchan 搬运", False)]:
+    check(f"channel identity {_o17!r} -> {_exp}", _v17(_o17) is _exp)
+_TN2.http = _o17
+
+# Ledger.absorb must not treat explicit False as missing (False == 0).
+_b17, _p17 = T.Budget(10, 50), T.HostPacer({})
+_l17 = T.Ledger()
+_pool17 = T.Pool(_b17, _p17)
+_ctx17 = T.Ctx({}, _pool17, _b17, _p17, _l17, net={})
+_fan17 = {"platform": "youtube", "id": "SHARED001", "title": "ASMR 助眠",
+          "author": "pomechan", "archive_of": "pomechan",
+          "channel_id": "UCFANCLUB1234567890abcde", "channel_verified": False}
+_real17 = {"platform": "youtube", "id": "SHARED001", "title": "ASMR 助眠",
+           "author": "pomechan", "archive_of": "pomechan",
+           "channel_id": "UC1Y-RkDrol_nyXk7vx8wgUA", "channel_verified": True}
+_l17.absorb(T.TaskResult(candidates=[_fan17]), T.Task.make("bili.view", bvid="x"))
+_l17.absorb(T.TaskResult(candidates=[_real17]), T.Task.make("bili.view", bvid="y"))
+_row17 = _l17.snapshot()["candidates"][0]
+check("an explicit channel_verified=False survives the merge",
+      _row17.get("channel_verified") is False, str(_row17))
+_c17 = T.creator_conclusion(_brands, _l17.snapshot()["candidates"], [], [])
+check("a rejected fan cid never becomes a confirmed creator id",
+      "UCFANCLUB1234567890abcde" not in _c17["ids"]["youtube_channel"]
+      and _c17["level"] != "confirmed", str(_c17["ids"]))
+
+print()
 bad = [n for n, c in R if not c]
 print(f"{len(R) - len(bad)}/{len(R)} checks passed")
 sys.exit(1 if bad else 0)
