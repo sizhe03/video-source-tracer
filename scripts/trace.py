@@ -595,10 +595,20 @@ def _is_hedged(text: str) -> bool:
     return any(h in (text or "") for h in _HEDGES)
 
 
+# "原作者是桑塔阿普亚" and "应该是桑塔阿普亚" were yielding 阿普亚 / 普亚:
+# the role/hedge prefix glued to the name and shifted the CJK run. Remove the
+# leading attribution phrase before tokenising.
+_NAME_PREFIX = re.compile(
+    r"^(?:原作者|原创|作者|原up|up主|转载自|搬运自|应该是|应该是这个|"
+    r"好像是|可能是|大概是|估计是|似乎是|是不是|应该|大概|估计|似乎|"
+    r"这是|这个是|是|叫|@)+[\s:：,，。、]*")
+
+
 def _comment_names(text: str) -> list[str]:
     """CJK runs in a comment that could be a creator's name."""
     from discover import _short_tokens
-    return _short_tokens(text)
+    cleaned = _NAME_PREFIX.sub("", (text or "").strip())
+    return _short_tokens(cleaned) or _short_tokens(text)
 
 
 _CHANNEL_ID = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
@@ -1273,20 +1283,33 @@ def diagnosis(earliest: dict, creator: dict, blocked: list[dict],
 
 # Words that mark a channel as belonging to this genre. A witness channel must
 # share some of them; a namesake musician shares none.
-_GENRE_HINT = {
-    "asmr", "助眠", "触发音", "触发", "丝袜", "耳朵", "掏耳", "采耳", "按摩",
-    "精油", "大腿", "摩擦", "耳语", "睡眠", "sleep", "relax", "tingle",
-    "massage", "trigger", "whisper", "ear",
+# CJK genre words are matched as substrings (Chinese has no spaces). Latin
+# words must match as WHOLE words -- a bare "ear" matched Learn, Early, Heart,
+# Clear, Gear, Year and let 25 Python tutorials pass as ASMR titles.
+_GENRE_CJK = {
+    "助眠", "触发音", "触发", "丝袜", "耳朵", "掏耳", "采耳", "按摩",
+    "精油", "大腿", "摩擦", "耳语", "睡眠", "睡眠導入", "オイル",
+    "スクランチ", "睡眠導入", "ASMR", "asmr",
 }
+_GENRE_LATIN = {
+    "asmr", "sleep", "relax", "relaxation", "tingle", "tingles",
+    "massage", "trigger", "triggers", "whisper", "whispers", "scratch",
+    "scratching", "tapping", "oil", "thigh", "thighs", "foot", "feet",
+    "no", "talking", "notalking",
+}
+_GENRE_WORD = re.compile(r"[a-z]+")
+
+
+def _genre_hit(title: str) -> bool:
+    low = (title or "").lower()
+    if any(g in low for g in _GENRE_CJK):
+        return True
+    words = set(_GENRE_WORD.findall(low))
+    return bool(words & _GENRE_LATIN)
 
 
 def _genre_overlap(titles: list[str]) -> int:
-    hits = 0
-    for tt in titles:
-        low = (tt or "").lower()
-        if any(g in low for g in _GENRE_HINT):
-            hits += 1
-    return hits
+    return sum(1 for tt in titles if _genre_hit(tt))
 
 
 def _witness(cands: list[dict], name: str | None) -> dict | None:
@@ -1338,10 +1361,8 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
     archived = [c for c in cands
                 if c.get("platform") == "youtube"
                 and (c.get("archive_of") or "").lower() == nl
-                # Only accept a catalogue whose channel identity was actually
-                # verified. run_archive_channel sets this after comparing the
-                # archive page's channel title against the claimed name.
-                and c.get("channel_verified")]
+                # Strict boolean: a truthy 1 / "yes" / "false" must not pass.
+                and c.get("channel_verified") is True]
     if archived:
         titles = [c.get("title") or "" for c in archived]
         # The author_match branch rejects a namesake by genre. The archived
@@ -1354,7 +1375,8 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
                 "title": archived[0].get("title"),
                 "catalogue_size": len(archived),
                 "genre_matches": hits,
-                "channel_verified": True,
+                "channel_verified": all(c.get("channel_verified") is True
+                                        for c in archived),
                 "basis": "archived_catalogue",
                 "note": "the creator's channel is gone; this catalogue comes "
                         "from a third-party archive"}

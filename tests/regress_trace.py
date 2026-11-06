@@ -407,6 +407,54 @@ except Exception as _e:                              # noqa: BLE001
           f"unexpected failure: {_e}")
 
 print()
+print("-- 14. word-boundary genre + namesake page + strict boolean ------")
+check("English substring 'ear' no longer counts as ASMR genre",
+      T._genre_overlap(["Learn origami crane tutorial"] * 5) == 0,
+      str(T._genre_overlap(["Learn origami crane tutorial"] * 5)))
+check("Heart/Early/Clear do not count as genre",
+      T._genre_overlap(["Heart surgery lecture", "Early piano lessons",
+                        "Clear the Gear", "Year in review"] * 3) == 0)
+check("real ASMR titles still count",
+      T._genre_overlap(["ASMR 丝袜 助眠"] * 5) == 5)
+
+_NS = ('<html><head><title>Pome-chan Python Tutorials</title>'
+       '<meta property="og:description" content="Watch all 25 ASMR videos '
+       'from Pome-chan"></head><body>'
+       '<div class="video-card__title"><a>Chapter 1: Learn Python</a>'
+       '</div></body></html>')
+class _NSResp:
+    status = 200
+    body = _NS.encode()
+_o = _TN2.http
+_TN2.http = lambda *a, **k: _NSResp()
+check("a namesake page mentioning the name is not verified",
+      _TN2.verify_channel("UC9999999999999999999999", "pomechan") is False,
+      "verify_channel must require a channel self-declaration")
+_TN2.http = _o
+
+_ns_rows = [{"platform": "youtube", "id": f"v{i:03d}",
+             "title": "Chapter %d: Learn Python, Clear the Gear, Heart of the Year" % i,
+             "author": "pomechan", "archive_of": "pomechan",
+             "channel_id": "UC9999999999999999999999",
+             "channel_verified": True} for i in range(25)]
+_c_ns = T.creator_conclusion(_brands, _ns_rows, [], [])
+check("namesake page + english-tutorial catalogue does not confirm",
+      _c_ns["level"] != "confirmed", str(_c_ns["level"]))
+check("namesake combo yields no attributed id",
+      not _c_ns["ids"]["youtube_channel"], str(_c_ns["ids"]))
+
+# a truthy non-boolean verification marker must not pass
+_truthy = [dict(r, channel_verified=1) for r in _archive_rows(_asr, False)]
+_c_t = T.creator_conclusion(_brands, _truthy, [], [])
+check("channel_verified=1 does not confirm",
+      _c_t["level"] != "confirmed", str(_c_t["level"]))
+
+check("name-prefix is stripped before extraction",
+      "桑塔阿普亚" in T._comment_names("应该是桑塔阿普亚")
+      and "桑塔阿普亚" in T._comment_names("原作者是桑塔阿普亚"),
+      str(T._comment_names("应该是桑塔阿普亚")))
+
+print()
 bad = [n for n, c in R if not c]
 print(f"{len(R) - len(bad)}/{len(R)} checks passed")
 sys.exit(1 if bad else 0)

@@ -275,25 +275,44 @@ def verify_channel(cid: str, name: str) -> bool:
     if r.status != 200:
         return False
     html = r.body.decode("utf-8", "replace")
-    # Normalise: drop separators and common suffixes, lowercase.
+
     def norm(x):
         return re.sub(r"[^a-z0-9\u4e00-\u9fff\u3040-\u30ff]", "",
                       (x or "").lower().replace("asmr", ""))
     key = norm(name)
     if len(key) < 3:
         return False
-    # The attribute must CONTAIN the whole name. `v in key` (reverse) let a
-    # two-letter alt like "ch" verify any channel, since "ch" is a substring
-    # of "pomechan". Measured: a page with only alt="ch" title="an" returned
-    # True. Require len(v) >= len(key) and key in v.
-    for m in re.finditer(r'(?:alt|title)="([^"]{2,120})"', html):
-        v = norm(m.group(1))
-        if len(v) >= len(key) and key in v:
-            return True
-    for m in re.finditer(r"<title>([^<]{2,160})</title>", html, re.I):
-        if key in norm(m.group(1)):
-            return True
-    return False
+
+    # The channel must IDENTIFY ITSELF. A page that merely mentions the name
+    # (a fan tribute, a cover compilation, a namesake) is not proof. The
+    # archive's meta description has the form:
+    #   "Watch all 239 ASMR videos from POMEchan🐾ASMR on The ASMR Index"
+    declared = False
+    for m in re.finditer(
+            r'<meta[^>]+(?:name|property)="(?:description|og:description)"'
+            r'[^>]+content="([^"]{10,400})"', html, re.I):
+        desc = m.group(1)
+        if not re.search(r"\d+\s*ASMR\s*videos\s*from", desc, re.I):
+            continue
+        # the declared channel name must contain the name we are verifying
+        if key in norm(desc) or key in norm(desc.split(" from ")[-1]):
+            declared = True
+            break
+    if not declared:
+        return False
+
+    # Genre self-check on the page's own video titles: a namesake channel of
+    # music or programming tutorials must not pass even with a similar name.
+    titles = re.findall(r'class="video-card__title"[^>]*>\s*<a[^>]*>'
+                        r'([^<]{3,200})', html)
+    if titles:
+        asmrish = sum(1 for t in titles
+                      if re.search(r"asmr|睡眠導入|sleep|trigger|scratch|"
+                                   r"tapping|massage|オイル|足裏|太もも",
+                                   t, re.I))
+        if asmrish < max(1, len(titles) // 3):
+            return False
+    return True
 
 
 def _thread_comments(aid: int):
