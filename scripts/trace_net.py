@@ -258,6 +258,41 @@ def resolve_channel(name: str, want_titles: bool = True) -> str | None:
     return None
 
 
+def verify_channel(cid: str, name: str) -> bool:
+    """True when the archive page for `cid` names this creator.
+
+    A channel id lifted from a web snippet is not evidence of identity until
+    the page it points at is checked. Verified against POMEchan: the page
+    carries alt="POMEchan🐾ASMR" and title="View POMEchan🐾ASMR".
+    """
+    if not cid or not name:
+        return False
+    try:
+        r = http(f"https://www.theasmrindex.com/channel/{cid}", timeout=25,
+                 headers=DESKTOP)
+    except Exception:                               # noqa: BLE001
+        return False
+    if r.status != 200:
+        return False
+    html = r.body.decode("utf-8", "replace")
+    # Normalise: drop separators and common suffixes, lowercase.
+    def norm(x):
+        return re.sub(r"[^a-z0-9\u4e00-\u9fff\u3040-\u30ff]", "",
+                      (x or "").lower().replace("asmr", ""))
+    key = norm(name)
+    if len(key) < 3:
+        return False
+    # look only at the channel-identity attributes, not all page text
+    for m in re.finditer(r'(?:alt|title)="([^"]{2,80})"', html):
+        v = norm(m.group(1))
+        if key and (key in v or v in key):
+            return True
+    for m in re.finditer(r"<title>([^<]{2,120})</title>", html, re.I):
+        if key in norm(m.group(1)):
+            return True
+    return False
+
+
 def archive_channel(cid: str, pages: int = 20) -> list[dict]:
     """Enumerate a deleted channel from theasmrindex's archive.
 
@@ -312,7 +347,8 @@ class LiveNet:
                 "reverse_image": reverse_image,
                 "archive_channel": archive_channel,
                 "resolve_channel": resolve_channel,
-                "websearch": websearch}
+                "websearch": websearch,
+                "verify_channel": verify_channel}
 
     def probe(self, target: str) -> dict:
         """Resolve a URL or bare id into the item dict trace.run() expects."""

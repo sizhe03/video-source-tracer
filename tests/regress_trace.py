@@ -293,9 +293,63 @@ check("SKILL.md warns that a blocked request is not an empty result",
 check("the declared-vs-implemented gap is empty",
       not (set(T.HOST_OF) - set(T.RUNNERS) - T._INTENTIONALLY_EMPTY),
       str(sorted(set(T.HOST_OF) - set(T.RUNNERS) - T._INTENTIONALLY_EMPTY)))
-check("every runner has a network channel or needs none",
-      all(k in ("alias.expand", "media.verify", "rank")
-          or True for k in T.RUNNERS), "smoke")
+# Runner names (bili.view) map to channel keys (view); assert the keys the
+# runners actually look up, not string equality between the two vocabularies.
+_needed = {"view", "related", "space", "search", "comments", "ytsearch",
+           "ytchannel", "ytoembed", "reverse_image", "archive_channel",
+           "websearch", "resolve_channel", "verify_channel"}
+sys.path.insert(0, str(HERE.parent / "scripts"))
+import trace_net as _TN  # noqa: E402
+_registered = set(_TN.LiveNet().channels())
+check("every channel a runner looks up is registered",
+      _needed <= _registered, str(sorted(_needed - _registered)))
+
+print()
+print("-- 11. a forged channel must NOT become a confirmed creator -------")
+_FAKE = "UCFORGED1234567890123456"
+_brands = [{"brand": "pomechan", "accounts": 3,
+            "platforms": ["bilibili", "youtube"], "sample": ["a", "b", "c"]}]
+
+
+def _archive_rows(titles, verified):
+    return [{"platform": "youtube", "id": f"vid{i:03d}", "title": t,
+             "author": "pomechan", "archive_of": "pomechan",
+             "channel_id": _FAKE, "channel_verified": verified}
+            for i, t in enumerate(titles)]
+
+
+_asr = [f"ASMR 丝袜 触发音 助眠 {i}" for i in range(25)]
+_orig = [f"折纸教程 第{i}期" for i in range(25)]
+
+_c_bad = T.creator_conclusion(_brands, _archive_rows(_asr, False), [], [])
+check("an unverified channel never yields confirmed",
+      _c_bad["level"] != "confirmed", str(_c_bad["level"]))
+check("an unverified channel never yields an attributed id",
+      not _c_bad["ids"]["youtube_channel"], str(_c_bad["ids"]))
+
+_c_genre = T.creator_conclusion(_brands, _archive_rows(_orig, True), [], [])
+check("a catalogue with no genre overlap never yields confirmed",
+      _c_genre["level"] != "confirmed", str(_c_genre["level"]))
+check("no-genre witness is rejected", _c_genre.get("witness") is None,
+      str(_c_genre.get("witness")))
+
+_c_ok = T.creator_conclusion(_brands, _archive_rows(_asr, True), [], [])
+check("verified + genre-consistent catalogue can confirm",
+      _c_ok["level"] == "confirmed", str(_c_ok["level"]))
+
+# a guess must never be called complete
+_d = T.diagnosis({"work_id": "BVx"}, {"name": "n", "level": "guess"},
+                 [], 10, 1)
+check("a guessed creator is never diagnosis=complete",
+      _d["stage"] != "complete", str(_d))
+# a later upload must not become earliest_known
+_e = T.earliest_known(
+    [{"platform": "bilibili", "id": "later", "pubdate": 2000,
+      "duration": 1989, "title": "【ASMR】丝袜\u201c脱了\u201d放我耳朵上？_丝袜触发音"}],
+    {"id": "in", "pubdate": 1000, "duration": 1989,
+     "title": "【ASMR】丝袜\u201c脱了\u201d放我耳朵上？_丝袜触发音"})
+check("a later upload is not reported as earlier",
+      _e["work_id"] is None, str(_e))
 
 print()
 bad = [n for n, c in R if not c]

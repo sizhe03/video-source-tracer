@@ -770,17 +770,21 @@ def run_archive_channel(task: Task, ctx: Ctx) -> TaskResult:
         return TaskResult(note=f"archive failed: {e}")
     cands = []
     name = task.params.get("name")
+    # Verify the archive page actually belongs to this name. Without this the
+    # runner echoes the query name onto every row, so ANY channel id found in
+    # a web result becomes "the creator's own catalogue".
+    verified = False
+    if name:
+        try:
+            verified = bool(ctx.net["verify_channel"](cid, name))
+        except Exception:                           # noqa: BLE001
+            verified = False
     for r in rows or []:
         cands.append({"platform": "youtube", "id": r.get("id"),
                       "title": r.get("title"), "author": name,
-                      # Marks this as an archived catalogue of a specific
-                      # creator, so witness detection can find it even though
-                      # the channel no longer exists.
                       "archive_of": name,
-                      # The resolved channel id. This is the identifier the
-                      # task asks for, and without storing it here the whole
-                      # web->archive->id chain left no trace in the output.
                       "channel_id": cid,
+                      "channel_verified": verified,
                       "pubdate": 0, "duration": 0})
     return TaskResult(candidates=cands,
                       evidence={"archived_titles": len(cands)})
@@ -1191,8 +1195,11 @@ def earliest_known(cands: list[dict], item: dict) -> dict:
     generic title search happened to surface: 2021 instead of 2026, off by five
     years, because sorting by pubdate alone has no notion of "same clip".
     """
+    input_pub = item.get("pubdate") or 0
     bili = [c for c in cands if c.get("platform") == "bilibili"
-            and c.get("pubdate") and c.get("id") != item.get("id")]
+            and c.get("pubdate") and c.get("id") != item.get("id")
+            # "earlier" is meaningless for something published after the input.
+            and (not input_pub or c["pubdate"] < input_pub)]
     gated = [c for c in bili if _same_subject(c, item, bili)]
     if not gated:
         return {"work_id": None, "platform": "bilibili", "pubdate": None,
@@ -1226,13 +1233,18 @@ def diagnosis(earliest: dict, creator: dict, blocked: list[dict],
       - source_unreachable the creator is named but their own work is gone
       - complete           both fields are filled
     """
-    if creator.get("name") and earliest.get("work_id"):
-        return {"stage": "complete",
-                "detail": "earliest copy and a credited creator both found"}
     if creator.get("name") and creator.get("level") == "guess":
         return {"stage": "name_is_a_guess",
                 "detail": "the only name came from a hedged comment; treat as "
                           "a lead, not an answer"}
+    if (creator.get("name") and creator.get("level") == "confirmed"
+            and earliest.get("work_id")):
+        return {"stage": "complete",
+                "detail": "earliest copy and a confirmed creator both found"}
+    if creator.get("name") and earliest.get("work_id"):
+        return {"stage": "unconfirmed_creator",
+                "detail": f"found an earlier upload and a {creator['level']} "
+                          "creator, but attribution is not confirmed"}
     if earliest.get("work_id") and not creator.get("name"):
         return {"stage": "copy_found_no_name",
                 "detail": f"found an earlier upload ({earliest['work_id']}) "
@@ -1289,8 +1301,13 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
     for c in cands:
         who = (c.get("author") or "")
         wl = who.lower()
-        if wl and (nl in wl or wl in nl):
-            by_author.setdefault(who, []).append(c)
+        if not (wl and (nl in wl or wl in nl)):
+            continue
+        # An archived row's author is just the query name echoed back by the
+        # runner. It is not evidence until the channel identity is verified.
+        if c.get("archive_of") and not c.get("channel_verified"):
+            continue
+        by_author.setdefault(who, []).append(c)
     for who, rows in by_author.items():
         titles = [r.get("title") or "" for r in rows]
         if _genre_overlap(titles) < max(1, len(titles) // 3):
@@ -1299,6 +1316,8 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
         return {"witness_work_id": best["id"], "title": best.get("title"),
                 "author": who, "catalogue_size": len(rows),
                 "genre_matches": _genre_overlap(titles),
+                "channel_verified": all(r.get("channel_verified", True)
+                                        for r in rows),
                 "basis": "author_match"}
 
     # 2. An ARCHIVED catalogue: the channel itself is gone, but a third party
@@ -1307,13 +1326,24 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
     #    is exactly the state the reference case was stuck in.
     archived = [c for c in cands
                 if c.get("platform") == "youtube"
-                and (c.get("archive_of") or "").lower() == nl]
+                and (c.get("archive_of") or "").lower() == nl
+                # Only accept a catalogue whose channel identity was actually
+                # verified. run_archive_channel sets this after comparing the
+                # archive page's channel title against the claimed name.
+                and c.get("channel_verified")]
     if archived:
         titles = [c.get("title") or "" for c in archived]
+        # The author_match branch rejects a namesake by genre. The archived
+        # branch must do the same, otherwise 25 folding-tutorial titles under
+        # a forged UC id become a "confirmed" creator.
+        hits = _genre_overlap(titles)
+        if hits < max(1, len(titles) // 3):
+            return None
         return {"witness_work_id": archived[0]["id"],
                 "title": archived[0].get("title"),
                 "catalogue_size": len(archived),
-                "genre_matches": _genre_overlap(titles),
+                "genre_matches": hits,
+                "channel_verified": True,
                 "basis": "archived_catalogue",
                 "note": "the creator's channel is gone; this catalogue comes "
                         "from a third-party archive"}
@@ -1341,23 +1371,29 @@ def known_ids(cands: list[dict], name: str | None,
     for c in cands:
         if (c.get("archive_of") or "").lower() != nl:
             continue
+        # A channel id counts only when BOTH the id shape is valid AND the
+        # archive page confirmed the channel belongs to this name.
+        if not c.get("channel_verified"):
+            continue
         cid = c.get("channel_id")
-        if cid and str(cid).startswith("UC") and cid not in channels:
+        if (isinstance(cid, str) and re.fullmatch(r"UC[A-Za-z0-9_-]{22}", cid)
+                and cid not in channels):
             channels.append(cid)
             basis.append("archived_catalogue")
 
+    # Web handles are hints, not positively attributed ids. Keep them in a
+    # separate bucket so they can never be read as "the creator's id".
     for i in (identities or []):
         v = i.get("value") or ""
         if v.startswith("@"):
             handles.append(v)
-            basis.append("web")
         elif v.startswith("x:"):
             handles.append("x.com/" + v[2:])
-            basis.append("web")
 
     return {
         "youtube_channel": channels,
         "handle": sorted(set(handles)),
+        "handle_is_unverified": bool(handles),
         "basis": sorted(set(basis)),
         # When nothing is attributed, say where the id still has to come from
         # rather than leaving an empty object that reads like "no ids exist".
@@ -1415,17 +1451,20 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
     top = candidates[0]
     wit = _witness(cands, top["name"])
     level = top["level"]
-    if wit and wit.get("catalogue_size", 0) >= 20:
-        # A body of work under the creator's name, large enough that it cannot
-        # be a coincidence, is the strongest attribution evidence obtainable
-        # without the creator's own statement. Promote only when the catalogue
-        # is substantial AND genre-consistent.
+    if (wit and wit.get("catalogue_size", 0) >= 20
+            and wit.get("genre_matches", 0) >= max(1, wit["catalogue_size"] // 3)
+            and wit.get("channel_verified")
+            and level in ("strong_lead", "weak_lead")):
+        # A large, genre-consistent catalogue whose channel identity was
+        # verified is the strongest attribution obtainable without the
+        # creator's own statement. Size alone is not enough: 25 arbitrary
+        # titles under a forged UC id used to satisfy this.
         level = "confirmed"
     return {
         "name": top["name"], "level": level,
         "witness": wit,
         "signature_work_id": None,
-        "witness_work_id": None,
+        "witness_work_id": (wit or {}).get("witness_work_id"),
         "brand_sources": [top["source"]],
         "independent_evidence_groups": top["independent_evidence_groups"],
         # Every distinct claim is kept, so a human's statement is never lost
