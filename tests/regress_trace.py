@@ -264,7 +264,7 @@ _d = out.get("diagnosis") or {}
 check("a diagnosis is always emitted", bool(_d.get("stage")), str(_d))
 check("it carries a human-readable detail", bool(_d.get("detail")), str(_d))
 check("a guessed name is reported as a guess, not as an answer",
-      _d.get("stage") != "complete" or out["creator_conclusion"]["level"] != "guess",
+      _d.get("stage") == "name_is_a_guess" or _d.get("stage") != "complete",
       str(_d))
 
 # The removed credit_rate must not come back by accident: on the real
@@ -350,6 +350,43 @@ _e = T.earliest_known(
      "title": "【ASMR】丝袜\u201c脱了\u201d放我耳朵上？_丝袜触发音"})
 check("a later upload is not reported as earlier",
       _e["work_id"] is None, str(_e))
+
+print()
+print("-- 12. the bypass paths found on re-review are closed -----------")
+import trace_net as _TN2
+
+# 1. verify_channel must not be fooled by a short alt/title attribute
+class _FakeResp:
+    status = 200
+    body = b'<img alt="ch" title="an">'
+_orig_http = _TN2.http
+_TN2.http = lambda *a, **k: _FakeResp()
+check("a short alt/title does not verify a channel",
+      _TN2.verify_channel("UCFORGED1234567890123456", "pomechan") is False,
+      "reverse substring shortcut must be gone")
+_TN2.http = _orig_http
+
+# 2. candidates with NO channel_verified field must not reach confirmed
+_rows_no_ver = [{"platform": "youtube", "id": f"v{i:03d}",
+                 "title": f"ASMR 丝袜 助眠 {i}", "author": "pomechan",
+                 "channel_id": "UCREAL0000000000000000"} for i in range(25)]
+_c_nv = T.creator_conclusion(_brands, _rows_no_ver, [], [])
+check("candidates without explicit verification never confirm",
+      _c_nv["level"] != "confirmed", str(_c_nv["level"]))
+check("unverified witness is rejected", _c_nv.get("witness") is None,
+      str(_c_nv.get("witness")))
+
+# 3. a verified channel with unrelated titles yields no creator id
+check("no-genre catalogue yields no attributed id",
+      not _c_genre["ids"]["youtube_channel"], str(_c_genre["ids"]))
+
+# 4. main() consumes --budget / --max-requests instead of treating 5 as a bvid
+# (inspect the source contract; actually running main() would hit the network)
+_tr_src = (HERE.parent / "scripts" / "trace.py").read_text(encoding="utf-8")
+check("main parses --budget and --max-requests",
+      'budget_s = float(_val("--budget"' in _tr_src
+      and 'max_requests = int(_val("--max-requests"' in _tr_src,
+      "documented flags must not be ignored")
 
 print()
 bad = [n for n, c in R if not c]

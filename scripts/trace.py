@@ -556,9 +556,18 @@ def run_search(task: Task, ctx: Ctx) -> TaskResult:
 @runner("bili.comments")
 def run_comments(task: Task, ctx: Ctx) -> TaskResult:
     """Mine the thread for a name. On this case it was the only source."""
-    import comments as C
     aid = task.params["aid"]
-    thread, meta = C.fetch_comments(aid)
+    # Prefer the injected channel so offline tests actually exercise this
+    # route. Fall back to the real module only when no stub was supplied.
+    fetch = ctx.net.get("fetch_comments")
+    if fetch is None:
+        import comments as C
+        fetch = C.fetch_comments
+    try:
+        thread, meta = fetch(aid)
+    except Exception as e:                          # noqa: BLE001
+        ctx.note_blocked("bili.comments", f"fetch failed: {e}")
+        return TaskResult(note=f"comment fetch failed: {e}")
     texts = []
     for c in thread:
         texts.append(c.get("text") or "")
@@ -1304,8 +1313,10 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
         if not (wl and (nl in wl or wl in nl)):
             continue
         # An archived row's author is just the query name echoed back by the
-        # runner. It is not evidence until the channel identity is verified.
-        if c.get("archive_of") and not c.get("channel_verified"):
+        # runner. And any row WITHOUT channel_verified (yt.channel, yt.search,
+        # related, space ...) is unverified too -- defaulting it to True let a
+        # plain 25-title channel become confirmed. Require the field explicitly.
+        if c.get("channel_verified") is not True:
             continue
         by_author.setdefault(who, []).append(c)
     for who, rows in by_author.items():
@@ -1316,7 +1327,7 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
         return {"witness_work_id": best["id"], "title": best.get("title"),
                 "author": who, "catalogue_size": len(rows),
                 "genre_matches": _genre_overlap(titles),
-                "channel_verified": all(r.get("channel_verified", True)
+                "channel_verified": all(r.get("channel_verified") is True
                                         for r in rows),
                 "basis": "author_match"}
 
@@ -1368,18 +1379,25 @@ def known_ids(cands: list[dict], name: str | None,
     nl = name.lower()
     channels, handles, basis = [], [], []
 
+    # Group archived rows by channel id. A channel id is only "the creator's
+    # id" when the catalogue under it is verified AND genre-consistent;
+    # otherwise a verified channel of folding tutorials would be reported as
+    # the ASMR creator's id.
+    by_cid: dict[str, list[dict]] = {}
     for c in cands:
         if (c.get("archive_of") or "").lower() != nl:
             continue
-        # A channel id counts only when BOTH the id shape is valid AND the
-        # archive page confirmed the channel belongs to this name.
-        if not c.get("channel_verified"):
+        if c.get("channel_verified") is not True:
             continue
         cid = c.get("channel_id")
-        if (isinstance(cid, str) and re.fullmatch(r"UC[A-Za-z0-9_-]{22}", cid)
-                and cid not in channels):
-            channels.append(cid)
-            basis.append("archived_catalogue")
+        if isinstance(cid, str) and re.fullmatch(r"UC[A-Za-z0-9_-]{22}", cid):
+            by_cid.setdefault(cid, []).append(c)
+    for cid, rows in by_cid.items():
+        titles = [r.get("title") or "" for r in rows]
+        if _genre_overlap(titles) < max(1, len(titles) // 3):
+            continue
+        channels.append(cid)
+        basis.append("archived_catalogue")
 
     # Web handles are hints, not positively attributed ids. Keep them in a
     # separate bucket so they can never be read as "the creator's id".
@@ -1479,13 +1497,37 @@ def main(argv: list[str]) -> int:
     if not argv:
         print(__doc__)
         return 2
-    target = next((a for a in argv if not a.startswith("--")), None)
+    def _val(flag, default):
+        if flag in argv:
+            i = argv.index(flag)
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                return argv[i + 1]
+        return default
+
+    # Flags must be consumed as VALUES, not mistaken for the video id.
+    skip = set()
+    for flag in ("--budget", "--max-requests", "--routes"):
+        if flag in argv:
+            i = argv.index(flag)
+            skip.add(i)
+            if i + 1 < len(argv):
+                skip.add(i + 1)
+    positional = [a for i, a in enumerate(argv)
+                  if i not in skip and not a.startswith("--")]
+    target = positional[0] if positional else None
     if not target:
         print(__doc__)
         return 2
+    try:
+        budget_s = float(_val("--budget", "90"))
+        max_requests = int(_val("--max-requests", "120"))
+    except ValueError as e:
+        raise SystemExit(f"invalid numeric flag: {e}")
+
     from trace_net import live_net
     item = live_net().probe(target)
-    out = run(item, net=live_net().channels())
+    out = run(item, net=live_net().channels(),
+              budget_s=budget_s, max_requests=max_requests)
     print(json.dumps(out, ensure_ascii=False, indent=1))
     return 0
 

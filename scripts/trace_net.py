@@ -282,12 +282,15 @@ def verify_channel(cid: str, name: str) -> bool:
     key = norm(name)
     if len(key) < 3:
         return False
-    # look only at the channel-identity attributes, not all page text
-    for m in re.finditer(r'(?:alt|title)="([^"]{2,80})"', html):
+    # The attribute must CONTAIN the whole name. `v in key` (reverse) let a
+    # two-letter alt like "ch" verify any channel, since "ch" is a substring
+    # of "pomechan". Measured: a page with only alt="ch" title="an" returned
+    # True. Require len(v) >= len(key) and key in v.
+    for m in re.finditer(r'(?:alt|title)="([^"]{2,120})"', html):
         v = norm(m.group(1))
-        if key and (key in v or v in key):
+        if len(v) >= len(key) and key in v:
             return True
-    for m in re.finditer(r"<title>([^<]{2,120})</title>", html, re.I):
+    for m in re.finditer(r"<title>([^<]{2,160})</title>", html, re.I):
         if key in norm(m.group(1)):
             return True
     return False
@@ -348,7 +351,8 @@ class LiveNet:
                 "archive_channel": archive_channel,
                 "resolve_channel": resolve_channel,
                 "websearch": websearch,
-                "verify_channel": verify_channel}
+                "verify_channel": verify_channel,
+                "fetch_comments": comments}
 
     def probe(self, target: str) -> dict:
         """Resolve a URL or bare id into the item dict trace.run() expects."""
