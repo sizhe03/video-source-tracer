@@ -359,17 +359,20 @@ def verify_channel(cid: str, name: str) -> bool:
              "thigh", "thighs", "foot", "feet"}
     NONGENRE = {"tutorial", "lesson", "lecture", "programming", "python",
                 "sql", "postgresql", "database", "guide", "review", "docs",
-                "documentation", "course", "chapter", "manual", "维修", "教程",
-                "讲解", "评测", "开箱"}
+                "documentation", "course", "chapter", "manual"}
+    NONGENRE_CJK = ("教程", "讲解", "评测", "开箱", "维修", "讲座", "综述",
+                    "指南", "医学", "解剖", "教学", "诊治", "编程", "数据库",
+                    "科普", "介绍", "入门")
     word = re.compile(r"[a-z]+")
 
     def hit(t):
         low = (t or "").lower()
-        if any(g in low for g in CJK) or "asmr" in word.findall(low):
-            return True
         w = set(word.findall(low))
-        if w & NONGENRE:
+        # Context guard FIRST, matching trace._genre_hit exactly.
+        if any(g in low for g in NONGENRE_CJK) or (w & NONGENRE):
             return False
+        if any(g in low for g in CJK) or "asmr" in w:
+            return True
         return bool(w & LATIN)
 
     asmrish = sum(1 for t in titles if hit(t))

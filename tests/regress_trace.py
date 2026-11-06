@@ -616,6 +616,23 @@ check("the engine still never claims confirmed",
       and _c18["level"] != "confirmed")
 
 print()
+print("-- 19. strong genre tokens cannot bypass the context guard ------")
+for _s19 in ("ASMR PostgreSQL database tutorial 1", "数据库触发器教程 第1讲",
+             "睡眠医学讲座 第1期", "ASMR 折纸教程 第1期"):
+    check(f"tutorial/medical title is not genre: {_s19[:20]}",
+          T._genre_hit(_s19) is False, str(T._genre_hit(_s19)))
+check("real ASMR catalogue titles still pass",
+      T._genre_hit("【4KASMR】睡眠導入 太ももオイル") is True)
+
+# ids are leads, never positively attributed answers
+_c19 = T.creator_conclusion(_brands, _archive_rows(_asr, True), [], [])
+check("ids carry an explicit lead status",
+      _c19["ids"].get("status") in ("lead_from_string_evidence", "no_lead"),
+      str(_c19["ids"].get("status")))
+check("ids no longer claim positive attribution",
+      "POSITIVELY" not in str(_c19["ids"])),
+
+print()
 bad = [n for n, c in R if not c]
 print(f"{len(R) - len(bad)}/{len(R)} checks passed")
 sys.exit(1 if bad else 0)

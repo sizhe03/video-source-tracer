@@ -1330,22 +1330,25 @@ _NONGENRE = {
 }
 
 
+# Instructional / documentary context. These override ANY genre token,
+# including a literal "ASMR" or a CJK word. Checked FIRST.
+_NONGENRE_CJK = (
+    "教程", "讲解", "评测", "开箱", "维修", "讲座", "综述", "指南", "医学",
+    "解剖", "教学", "诊治", "编程", "数据库", "科普", "介绍", "入门",
+)
+
+
 def _genre_hit(title: str) -> bool:
     low = (title or "").lower()
-    # Real ASMR titles almost always carry a CJK genre word or the literal
-    # ASMR token; those are unambiguous in this corpus.
-    if any(g in low for g in _GENRE_CJK) or "asmr" in _GENRE_WORD.findall(low):
-        return True
     words = set(_GENRE_WORD.findall(low))
-    hits = words & _GENRE_LATIN
-    if not hits:
+    # The context guard must come BEFORE the strong genre tokens. Reviewers
+    # kept adding "ASMR PostgreSQL tutorial" / "数据库触发器教程": a CJK or
+    # ASMR token used to return True here and skip the tutorial check.
+    if any(g in low for g in _NONGENRE_CJK) or (words & _NONGENRE):
         return False
-    # Instructional context wins over ANY number of ambiguous genre tokens.
-    # "PostgreSQL database sleep trigger tutorial" has two hits (sleep,
-    # trigger) and used to pass via `len(hits)>=2` before this guard.
-    if words & _NONGENRE:
-        return False
-    return len(hits) >= 1
+    if any(g in low for g in _GENRE_CJK) or "asmr" in words:
+        return True
+    return bool(words & _GENRE_LATIN)
 
 
 def _genre_overlap(titles: list[str]) -> int:
@@ -1442,16 +1445,13 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
 
 def known_ids(cands: list[dict], name: str | None,
               identities: list[dict] | None = None) -> dict:
-    """Identifiers we have POSITIVELY attributed to the named creator.
+    """Channel identifiers that are LEADS for the named creator.
 
-    Deliberately conservative. A reuploader's channel id is NOT the creator's,
-    and recording it as such would be a wrong answer. Measured: YouTube search
-    for POMEchan returns Magaimono, PAN ASMR, Asmr Zone and a musician called
-    Pome-chan -- none of them POMEchan.
-
-    Only two sources count:
-      - an archived catalogue, which is the creator's own body of work
-      - an author whose titles pass the genre test (the namesake guard)
+    These come from a string chain (web snippet -> archive page
+    self-declaration -> genre wordlist). That chain cannot PROVE identity --
+    nine review rounds kept producing new wordlist variants -- so these are
+    explicitly leads, never "positively attributed". A human confirms by
+    opening the channel. The user accepts high-likelihood leads.
     """
     if not name:
         return {"youtube_channel": [], "handle": [], "note": "no name"}
@@ -1495,12 +1495,13 @@ def known_ids(cands: list[dict], name: str | None,
         "handle": sorted(set(handles)),
         "handle_is_unverified": bool(handles),
         "basis": sorted(set(basis)),
-        # When nothing is attributed, say where the id still has to come from
-        # rather than leaving an empty object that reads like "no ids exist".
+        # Honest status: every id here is a lead from string evidence, not a
+        # proven attribution. Keep the same status even when the list is empty.
+        "status": "lead_from_string_evidence" if channels else "no_lead",
+        "confirm_by": ("open the channel and check the creator's own statement"
+                       if channels else None),
         "unresolved": ([] if channels else
-                       ["channel id not derivable from this engine: YouTube "
-                        "search returns only reuploaders and the archive does "
-                        "not index this creator by name"]),
+                       ["no channel id lead found in the searched sources"]),
     }
 
 
