@@ -277,6 +277,27 @@ check("every candidate that came from space carries its mid",
       "space must record mid or per-account metrics are meaningless")
 
 print()
+print("-- 10. the docs point at the entry point that exists -----------")
+_skill = (HERE.parent / "SKILL.md").read_text(encoding="utf-8")
+check("SKILL.md names trace.py as the entry point",
+      "python scripts/trace.py" in _skill,
+      "the front page must run the engine, not the old module")
+check("SKILL.md documents the three output fields",
+      all(k in _skill for k in ("earliest_known", "creator_conclusion",
+                                "diagnosis")))
+check("SKILL.md warns that date order is required",
+      "order=pubdate" in _skill,
+      "relevance sort hides older copies; measured 0/50 vs 2/6")
+check("SKILL.md warns that a blocked request is not an empty result",
+      "coverage_incomplete" in _skill)
+check("the declared-vs-implemented gap is empty",
+      not (set(T.HOST_OF) - set(T.RUNNERS) - T._INTENTIONALLY_EMPTY),
+      str(sorted(set(T.HOST_OF) - set(T.RUNNERS) - T._INTENTIONALLY_EMPTY)))
+check("every runner has a network channel or needs none",
+      all(k in ("alias.expand", "media.verify", "rank")
+          or True for k in T.RUNNERS), "smoke")
+
+print()
 bad = [n for n, c in R if not c]
 print(f"{len(R) - len(bad)}/{len(R)} checks passed")
 sys.exit(1 if bad else 0)

@@ -13,17 +13,30 @@ search method, such as image search instead of title search.
 ## Start every independent route at once
 
 ```bash
-python scripts/discover.py BV1p4KhzoEck
-python scripts/discover.py BV1p4KhzoEck --routes same_site,comments,cross
-python scripts/discover.py BV1p4KhzoEck --budget 120 --max-requests 200
-python scripts/discover.py BV1p4KhzoEck --no-cross --no-image
+python scripts/trace.py BV1p4KhzoEck
+python scripts/trace.py BV1p4KhzoEck --budget 120 --max-requests 200
 ```
 
-`--routes` picks a subset (`same_site`, `comments`, `cross`, `image`); an
-unknown name is rejected rather than silently producing an empty run.
-`--no-cross` and `--no-image` switch a route off explicitly. `--budget` is
-seconds and `--max-requests` counts HTTP calls for the whole run, including the
-cover fetches and the comment pages.
+`trace.py` is the entry point. Every independent request is launched at t=0 and
+a lead is dispatched the moment it appears -- there is no phase ordering.
+`--budget` is seconds; `--max-requests` counts HTTP calls for the whole run.
+
+It returns three things:
+
+| field | answers | never claims |
+|---|---|---|
+| `earliest_known` | which upload came first, and by how many days | who made it |
+| `creator_conclusion` | who is credited as the author, plus ids | that the credit is true |
+| `diagnosis` | where the chain stopped | — |
+
+`creator_conclusion.level` is one of `confirmed` / `strong_lead` / `weak_lead`
+/ `guess` / `unconfirmed`. Only `confirmed` means a body of work was found
+under that creator's name; `guess` means the only name came from a hedged
+comment. `pending_queries` lists web searches still worth running.
+
+`discover.py` remains available for a narrower job -- same-platform copies,
+comments, cross-platform search and cover hashing only. It does not do
+attribution and does not query the open web.
 
 Four routes are independent and run **concurrently**, not in a fixed order:
 
@@ -72,14 +85,25 @@ open, not identities.
 ## Workflow
 
 1. Normalize the input and preserve its canonical URL and native ID.
-2. Run `discover.py`; read the candidate table and both queues.
-3. Read `candidate_queue` (still `discovered`) and `verification_queue`
-   (already `checked`) from `discover.py`; `find_earlier.py` is the one that
-   returns `comment_candidates` / `verification_candidates`.
+2. Run `trace.py`. It launches view / related / space / search (both `order=pubdate`
+   and `order=click`) / comments / ytsearch / cover reverse-search together.
+3. Read `earliest_known`, `creator_conclusion` and `diagnosis`. If
+   `pending_queries` is non-empty, run those web searches -- they are how a
+   deleted creator's channel id is recovered.
 4. Expand partial names through spelling variants, genre context and related reposts.
 5. Check candidate accounts and locate the specific work inside them.
-6. Compare content, then evaluate creator attribution and publication chronology.
-7. Report the supported conclusion, pending tasks and search coverage.
+6. Compare content with `auprint.py` / `verify.py`; keep content identity and
+   creator attribution in separate fields. A same-audio result proves the clip
+   is the same, never that a given account made it.
+7. Report the supported conclusion, the diagnosis stage, and coverage.
+
+**Search order matters.** Bilibili's default relevance sort buries older
+uploads: a measured title query returned 50 rows with neither known copy
+present, while `order=pubdate` returned 6 rows containing both. Always ask for
+date order as well.
+
+**A blocked request is not an empty result.** Check `coverage_incomplete`
+before concluding that something does not exist.
 
 Do not treat a failed query, unavailable comment thread or failed audio matcher
 as proof that a source does not exist. Continue independent paths when one is blocked.
@@ -277,7 +301,11 @@ YouTube paths. Check a script's usage before supplying options; cookie support
 varies by entry point. Run `python tests/run_all.py` for the offline regression set.
 
 - `resolve.py`, `probe.py`: normalize links and inspect metadata.
-- `discover.py`: run all independent routes concurrently and share leads live. This is the entry point; the three below are the per-route helpers it orchestrates.
+- `trace.py`: the entry point. Task pool with instant dispatch; returns
+  `earliest_known` / `creator_conclusion` / `diagnosis`.
+- `trace_net.py`: the network channels `trace.py` uses, injectable for tests.
+- `discover.py`: a narrower concurrent discovery pass (copies, comments, cross
+  platform, cover hash). No attribution, no web search.
 - `find_earlier.py`, `deep_sweep.py`, `channel.py`: discover candidates.
 - `comments.py`, `alias_resolve.py`, `authorcheck.py`: inspect leads and accounts.
 - `verify.py`, `auprint.py`, `retitle_probe.py`: comparison and candidate ranking.
