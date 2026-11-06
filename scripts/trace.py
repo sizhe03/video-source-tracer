@@ -1,0 +1,1085 @@
+#!/usr/bin/env python
+"""Trace a video to its earliest upload and to the creator it credits.
+
+This replaces the four-route structure in discover.py. The unit of parallelism
+is a TASK, not a route: every independent request is launched at t=0, and the
+moment a task yields a lead the successor task is appended from inside that
+task's own call stack. Nothing polls.
+
+Two tables, never one:
+    earliest_known      which upload came first   (content + chronology only)
+    creator_conclusion  who is credited as author (attribution only)
+
+Keeping them apart is the whole point. A work can be the earliest copy of a
+clip and still not be the creator's -- that is the normal case for a repost
+account, and merging the two produced the wrong answer once already.
+
+Usage:
+    python trace.py BV1rCxf6MERM
+    python trace.py BV1rCxf6MERM --budget 90 --max-requests 120
+    python trace.py BV1rCxf6MERM --routes view,space,related,search
+"""
+from __future__ import annotations
+
+import json
+import queue
+import re
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from _common import note, setup_stdio
+
+# ---------------------------------------------------------------- constants
+KEY_VERSION = 1
+
+# Per-host pacing. These are starting intervals, not locks: several requests to
+# the same host may be in flight, they just may not START closer than this.
+DEFAULT_GAPS = {
+    "api.bilibili.com": 6.0,
+    "www.youtube.com": 2.0,
+    "i0.hdslb.com": 0.5,
+    "i1.hdslb.com": 0.5,
+    "yandex.com": 3.0,
+    "theasmrindex.com": 3.0,
+    "web.archive.org": 2.0,
+}
+
+# Which host each task kind bills to.
+HOST_OF = {
+    "bili.view": "api.bilibili.com",
+    "bili.related": "api.bilibili.com",
+    "bili.space": "api.bilibili.com",
+    "bili.search": "api.bilibili.com",
+    "bili.comments": "api.bilibili.com",
+    "yt.search": "www.youtube.com",
+    "yt.channel": "www.youtube.com",
+    "yt.oembed": "www.youtube.com",
+    "cover.phash": "i0.hdslb.com",
+    "image.reverse": "yandex.com",
+    "archive.channel": "theasmrindex.com",
+    "alias.expand": None,
+    "media.verify": None,
+    "rank": None,
+}
+
+# Priority decides WHICH request gets the next slot on a busy host. space ranks
+# above search because an uploader's own titles are where a repost account
+# leaves the original creator's name; a title search returns copies, not names.
+PRIORITY = {
+    "bili.view": 100,
+    "bili.space": 95,
+    # Comments outrank related and search: the thread is the one channel that
+    # does not depend on the uploader writing a credit, and on the reference
+    # case it was the only place a name appeared. At priority 70 it was the
+    # sixth bilibili request (~30 s) and a 40 s budget could miss it entirely.
+    "bili.comments": 92,
+    "bili.related": 88,
+    "yt.channel": 85,
+    "bili.search": 80,
+    "yt.search": 75,
+    "yt.oembed": 60,
+    "image.reverse": 55,
+    "archive.channel": 50,
+    "cover.phash": 40,
+    "alias.expand": 30,
+    "media.verify": 20,
+    "rank": 5,
+}
+
+# A lane with a single worker: some runners mutate module-level state that is
+# not thread-safe (comments.py swaps its transport in and out), so two of them
+# running at once would restore each other's settings.
+LANE_OF = {
+    "bili.comments": "comments",
+    "alias.expand": "cpu",
+    "media.verify": "media",
+    "rank": "cpu",
+}
+
+MOBILE_UA_KINDS = {"bili.space"}
+
+ENRICHMENT_KINDS = {"cover.phash", "image.reverse"}
+
+
+# ------------------------------------------------------------------- budget
+class Budget:
+    """Wall clock plus a global request allowance, shared by every task."""
+
+    def __init__(self, seconds: float, requests: int):
+        self.deadline = time.monotonic() + seconds
+        self.total = requests
+        self.left = requests
+        self.spent = 0
+        self._lock = threading.Lock()
+
+    def take(self, *, enrichment: bool = False) -> bool:
+        with self._lock:
+            if self.left <= 0 or time.monotonic() > self.deadline:
+                return False
+            if enrichment:
+                reserve = max(1, min(2, self.total // 3))
+                if self.left <= reserve:
+                    return False
+            self.left -= 1
+            self.spent += 1
+            return True
+
+    def expired(self) -> bool:
+        with self._lock:
+            return self.left <= 0 or time.monotonic() > self.deadline
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {"requests_left": self.left, "requests_spent": self.spent,
+                    "seconds_left": round(max(0.0, self.deadline - time.monotonic()), 1)}
+
+
+# -------------------------------------------------------------- rate limiter
+class HostPacer:
+    """One starting interval per host, enforced across threads.
+
+    Sleeping happens OUTSIDE the lock, so a host is rate-limited but not
+    exclusive: two requests to the same host can overlap in flight, they just
+    cannot begin closer together than the gap. `peek` lets a worker skip a
+    cooled-down host and take a ready task elsewhere instead of blocking.
+    """
+
+    def __init__(self, gaps: dict[str, float] | None = None, default: float = 3.0):
+        self.gaps = dict(DEFAULT_GAPS)
+        if gaps:
+            self.gaps.update(gaps)
+        self.default = default
+        self.next_slot: dict[str, float] = {}
+        self.lock = threading.Lock()
+        self.waits = 0
+
+    def peek(self, host: str | None) -> float:
+        """Seconds until this host may be used again. 0 = ready now."""
+        if host is None:
+            return 0.0
+        with self.lock:
+            return max(0.0, self.next_slot.get(host, 0.0) - time.monotonic())
+
+    def reserve(self, host: str | None) -> float:
+        """Claim the next slot on this host; returns how long to sleep first."""
+        if host is None:
+            return 0.0
+        gap = self.gaps.get(host, self.default)
+        with self.lock:
+            now = time.monotonic()
+            slot = max(now, self.next_slot.get(host, now))
+            self.next_slot[host] = slot + gap
+            if slot > now:
+                self.waits += 1
+        return max(0.0, slot - time.monotonic())
+
+    def wait(self, host: str | None) -> None:
+        delay = self.reserve(host)
+        if delay > 0:
+            time.sleep(delay)
+
+
+# --------------------------------------------------------------------- task
+@dataclass
+class Task:
+    kind: str
+    params: dict
+    dedup_key: str
+    id: str = ""
+    host: str | None = None
+    lane: str = "net"
+    depth: int = 0
+    parent: str | None = None
+    origin: dict | None = None
+    state: str = "READY"
+    priority: int = 50
+    enrichment: bool = False
+    ua: str = "desktop"
+    result: "TaskResult | None" = None
+    error: str | None = None
+    reason: str | None = None
+    started_at: float | None = None
+    ended_at: float | None = None
+
+    @staticmethod
+    def make(kind: str, *, parent: "Task | None" = None, origin: dict | None = None,
+             **params) -> "Task":
+        return Task(
+            kind=kind, params=params, dedup_key=canonical_key(kind, params),
+            host=HOST_OF.get(kind), lane=LANE_OF.get(kind, "net"),
+            depth=(parent.depth + 1) if parent else 0,
+            parent=parent.id if parent else None,
+            origin=origin,
+            priority=PRIORITY.get(kind, 50),
+            enrichment=kind in ENRICHMENT_KINDS,
+            ua="mobile" if kind in MOBILE_UA_KINDS else "desktop",
+        )
+
+
+def canonical_key(kind: str, params: dict) -> str:
+    """The ONLY thing that decides whether two tasks are the same task."""
+    bits = [f"v{KEY_VERSION}", kind]
+    for k in sorted(params):
+        v = params[k]
+        if isinstance(v, str):
+            v = v.strip().lower()
+        bits.append(f"{k}={v}")
+    return "|".join(bits)
+
+
+@dataclass
+class TaskResult:
+    candidates: list[dict] = field(default_factory=list)
+    leads: list[dict] = field(default_factory=list)
+    evidence: dict = field(default_factory=dict)
+    note: str | None = None
+
+
+# ------------------------------------------------------------------- ledger
+class Ledger:
+    """Candidates plus the edges that produced them. Provenance is factual."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cands: dict[str, dict] = {}
+        self.edges: list[dict] = []
+        self.dupes = 0
+
+    def absorb(self, result: TaskResult, task: Task) -> None:
+        with self.lock:
+            for c in result.candidates:
+                key = c.get("key") or f"{c.get('platform')}:{c.get('id')}"
+                cur = self.cands.get(key)
+                if cur is None:
+                    self.cands[key] = dict(c, key=key, edges=[])
+                    cur = self.cands[key]
+                else:
+                    self.dupes += 1
+                    # Merge rather than drop: the same video arrives from
+                    # several routes and each may know a field the first did
+                    # not (view knows mid, search knows the cover, space knows
+                    # the uploader). Keeping only the first writer is how the
+                    # per-account signal went missing.
+                    for k, v in c.items():
+                        if v not in (None, "", 0) and cur.get(k) in (None, "", 0):
+                            cur[k] = v
+                if task.origin:
+                    self.edges.append(dict(task.origin))
+                    cur["edges"].append(task.origin)
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {"candidates": list(self.cands.values()),
+                    "edges": list(self.edges), "duplicates_merged": self.dupes}
+
+
+# --------------------------------------------------------------------- pool
+class Pool:
+    """Task pool. New work is appended from the producing task's own stack."""
+
+    def __init__(self, budget: Budget, pacer: HostPacer, max_tasks: int = 400,
+                 workers: int = 8):
+        self.budget = budget
+        self.pacer = pacer
+        self.max_tasks = max_tasks
+        self.workers = workers
+        self.cv = threading.Condition()
+        self.ready: list[Task] = []
+        self.tasks: dict[str, Task] = {}
+        self.seen: set[str] = set()
+        self.done = 0
+        self.failed = 0
+        self.blocked = 0
+        self.stopping = False
+        self.stop_reason: str | None = None
+        self._next_id = 0
+        self.on_result: Callable[[Task], None] | None = None
+
+    # -- scheduling ------------------------------------------------------
+    def spawn(self, task: Task) -> bool:
+        """Append a task. Called from inside a runner; wakes one worker."""
+        with self.cv:
+            if task.dedup_key in self.seen:
+                return False
+            if len(self.tasks) >= self.max_tasks:
+                return False
+            self.seen.add(task.dedup_key)
+            self._next_id += 1
+            task.id = f"t{self._next_id}"
+            self.tasks[task.id] = task
+            self.ready.append(task)
+            self.cv.notify()
+            return True
+
+    def _pick(self) -> Task | None:
+        """Highest priority task whose host is not cooling down."""
+        best = None
+        best_wait = 0.0
+        for i, t in enumerate(self.ready):
+            wait = self.pacer.peek(t.host)
+            if wait <= 0:
+                if best is None or t.priority > self.ready[best].priority:
+                    best = i
+            elif best is None and (best_wait == 0.0 or wait < best_wait):
+                best_wait = wait
+        if best is not None:
+            return self.ready.pop(best)
+        return None
+
+    def next_task(self) -> Task | None:
+        with self.cv:
+            while True:
+                if self.stopping:
+                    return None
+                t = self._pick()
+                if t is not None:
+                    t.state = "RUNNING"
+                    return t
+                if not self.ready and self._all_done():
+                    return None
+                if self.budget.expired():
+                    self.stopping = True
+                    self.stop_reason = self.stop_reason or "budget"
+                    self.cv.notify_all()
+                    return None
+                # Wait only until the nearest host cools down; a spawn() from
+                # another worker notifies immediately and pre-empts this.
+                waits = [self.pacer.peek(t.host) for t in self.ready] or [0.2]
+                self.cv.wait(timeout=min(min(waits), 0.2))
+
+    def _all_done(self) -> bool:
+        return all(t.state in ("DONE", "FAILED", "BLOCKED", "SKIPPED", "ABORTED")
+                   for t in self.tasks.values())
+
+    def finish(self, task: Task) -> None:
+        with self.cv:
+            self.done += 1
+            if task.state == "FAILED":
+                self.failed += 1
+            elif task.state == "BLOCKED":
+                self.blocked += 1
+            self.cv.notify_all()
+
+    def stop(self, reason: str) -> None:
+        with self.cv:
+            if not self.stopping:
+                self.stopping = True
+                self.stop_reason = reason
+            self.cv.notify_all()
+
+
+# ------------------------------------------------------------------ runners
+Runner = Callable[[Task, "Ctx"], TaskResult]
+
+
+class Ctx:
+    """Everything a runner may touch. The network layer is injectable."""
+
+    def __init__(self, item: dict, pool: Pool, budget: Budget, pacer: HostPacer,
+                 ledger: Ledger, *, net: dict | None = None):
+        self.item = item
+        self.pool = pool
+        self.budget = budget
+        self.pacer = pacer
+        self.ledger = ledger
+        self.net = net or {}
+        self.blocked: list[dict] = []
+        self._blocked_lock = threading.Lock()
+
+    def note_blocked(self, what: str, reason: str) -> None:
+        with self._blocked_lock:
+            self.blocked.append({"what": what, "reason": reason[:160]})
+
+    def blocked_count(self) -> int:
+        with self._blocked_lock:
+            return len(self.blocked)
+
+    def comment_names(self) -> list[str]:
+        """Names a human wrote in the thread. Kept apart from title brands."""
+        return [d["name"] for d in self.comment_name_details()]
+
+    def note_comment_name(self, name: str, hedged: bool = False) -> None:
+        with self._blocked_lock:
+            if not hasattr(self, "_cnamed"):
+                self._cnamed = {}
+            # A hedge never upgrades an earlier confident mention.
+            self._cnamed[name] = self._cnamed.get(name, True) and hedged
+
+    def comment_name_details(self) -> list[dict]:
+        with self._blocked_lock:
+            return [{"name": n, "hedged": h}
+                    for n, h in getattr(self, "_cnamed", {}).items()]
+
+
+RUNNERS: dict[str, Runner] = {}
+
+
+def runner(kind: str):
+    def deco(fn: Runner) -> Runner:
+        RUNNERS[kind] = fn
+        return fn
+    return deco
+
+
+def _strip_tags(s: str) -> str:
+    """search/type injects <em class="keyword"> around the matched term."""
+    return re.sub(r"<[^>]+>", "", s or "")
+
+
+@runner("bili.view")
+def run_view(task: Task, ctx: Ctx) -> TaskResult:
+    j = ctx.net["view"](task.params["bvid"])
+    if j.get("code") != 0:
+        ctx.note_blocked("view", f"code {j.get('code')}")
+        return TaskResult(note=f"view code {j.get('code')}")
+    d = j.get("data") or {}
+    out = TaskResult(candidates=[{
+        "platform": "bilibili", "id": d.get("bvid"),
+        "title": _strip_tags(d.get("title") or ""),
+        "author": (d.get("owner") or {}).get("name"),
+        "mid": (d.get("owner") or {}).get("mid"),
+        "pubdate": d.get("pubdate") or 0,
+        "duration": d.get("duration") or 0,
+    }])
+    owner = d.get("owner") or {}
+    if owner.get("mid"):
+        # An uploader's own timeline is the cheapest place a repost leaves the
+        # original creator's name, so it is queued the moment we learn the mid.
+        ctx.pool.spawn(Task.make("bili.space", parent=task,
+                                 origin={"src": task.id, "kind": "owner"},
+                                 mid=owner["mid"], pn=1))
+    return out
+
+
+@runner("bili.space")
+def run_space(task: Task, ctx: Ctx) -> TaskResult:
+    j = ctx.net["space"](task.params["mid"], task.params.get("pn", 1))
+    if j.get("code") != 0:
+        ctx.note_blocked("space", f"code {j.get('code')}")
+        return TaskResult(note=f"space code {j.get('code')}")
+    vlist = (((j.get("data") or {}).get("list") or {}).get("vlist") or [])
+    cands, brands = [], {}
+    for v in vlist:
+        title = _strip_tags(v.get("title") or "")
+        cands.append({
+            "platform": "bilibili", "id": v.get("bvid"), "title": title,
+            "author": v.get("author"),
+            # Which account this came from. Without it a candidate cannot be
+            # attributed to an uploader, so no per-account or per-ring signal
+            # is computable -- the missing field that broke credit_rate.
+            "mid": task.params.get("mid"),
+            "pubdate": v.get("created") or 0,
+            "duration": _secs(v.get("length")),
+        })
+        for b in brand_tokens(title):
+            brands.setdefault(b, 0)
+            brands[b] += 1
+    leads = []
+    for b, n in brands.items():
+        leads.append({"kind": "brand", "value": b, "count": n,
+                      "source": "space"})
+    return TaskResult(candidates=cands, leads=leads)
+
+
+@runner("bili.related")
+def run_related(task: Task, ctx: Ctx) -> TaskResult:
+    j = ctx.net["related"](task.params["bvid"])
+    if j.get("code") != 0:
+        ctx.note_blocked("related", f"code {j.get('code')}")
+        return TaskResult(note=f"related code {j.get('code')}")
+    cands = []
+    for v in (j.get("data") or []):
+        cands.append({
+            "platform": "bilibili", "id": v.get("bvid"),
+            "title": _strip_tags(v.get("title") or ""),
+            "author": (v.get("owner") or {}).get("name"),
+            "pubdate": v.get("pubdate") or 0,
+            "duration": v.get("duration") or 0,
+        })
+    # Measured precision is 2.6%: 39 neighbours, 1 real copy. Reading titles for
+    # a brand is free; treating them as candidates or recursing into them is
+    # not, so this runner deliberately spawns nothing.
+    leads = []
+    for v in (j.get("data") or []):
+        for b in brand_tokens(_strip_tags(v.get("title") or "")):
+            leads.append({"kind": "brand", "value": b, "count": 1,
+                          "source": "related"})
+    return TaskResult(candidates=cands, leads=leads)
+
+
+@runner("bili.search")
+def run_search(task: Task, ctx: Ctx) -> TaskResult:
+    j = ctx.net["search"](task.params["kw"], task.params.get("page", 1),
+                          task.params.get("order", "pubdate"))
+    if j.get("code") != 0:
+        ctx.note_blocked("search", f"code {j.get('code')}")
+        return TaskResult(note=f"search code {j.get('code')}")
+    cands = []
+    for r in ((j.get("data") or {}).get("result") or []):
+        cands.append({
+            "platform": "bilibili", "id": r.get("bvid"),
+            "title": _strip_tags(r.get("title") or ""),
+            "author": r.get("author"), "pubdate": r.get("pubdate") or 0,
+            "duration": _secs(r.get("duration")),
+            "cover": r.get("pic"),
+        })
+    return TaskResult(candidates=cands)
+
+
+@runner("bili.comments")
+def run_comments(task: Task, ctx: Ctx) -> TaskResult:
+    """Mine the thread for a name. On this case it was the only source."""
+    import comments as C
+    aid = task.params["aid"]
+    thread, meta = C.fetch_comments(aid)
+    texts = []
+    for c in thread:
+        texts.append(c.get("text") or "")
+        for n in c.get("nested") or []:
+            texts.append(n.get("text") or "")
+    leads = []
+    for txt in texts:
+        hedged = _is_hedged(txt)
+        for tok in _comment_names(txt):
+            leads.append({"kind": "brand", "value": tok, "count": 1,
+                          "source": "comments", "hedged": hedged})
+            ctx.note_comment_name(tok, hedged=hedged)
+    return TaskResult(leads=leads,
+                      evidence={"comments_read": len(texts),
+                                "declared": meta.get("declared_all_count")})
+
+
+# "I think", "probably", "should be" -- the writer is guessing.
+_HEDGES = ("应该是", "好像是", "可能是", "大概是", "估计是", "似乎是",
+           "是不是", "不确定", "也许", "或许", "应该", "好像", "可能",
+           "大概", "估计", "似乎", "我猜", "猜是")
+
+
+def _is_hedged(text: str) -> bool:
+    return any(h in (text or "") for h in _HEDGES)
+
+
+def _comment_names(text: str) -> list[str]:
+    """CJK runs in a comment that could be a creator's name."""
+    from discover import _short_tokens
+    return _short_tokens(text)
+
+
+@runner("yt.search")
+def run_yt_search(task: Task, ctx: Ctx) -> TaskResult:
+    hits = ctx.net["ytsearch"](task.params["q"], task.params.get("n", 20))
+    cands = []
+    for e in hits or []:
+        cands.append({
+            "platform": "youtube", "id": e.get("id"),
+            "title": _strip_tags(e.get("title") or ""),
+            "author": e.get("channel") or e.get("uploader"),
+            "pubdate": 0, "duration": int(e.get("duration") or 0) or 0,
+        })
+    return TaskResult(candidates=cands)
+
+
+def _secs(d) -> int:
+    if isinstance(d, int):
+        return d
+    if not d:
+        return 0
+    total = 0
+    for p in str(d).split(":"):
+        if p.strip().isdigit():
+            total = total * 60 + int(p)
+    return total
+
+
+# ------------------------------------------------------------ brand tokens
+_NOT_A_BRAND = {
+    # format / resolution / platform
+    "asmr", "4k", "8k", "1080p", "720p", "3dio", "3d", "hires", "hi-res",
+    "no", "talking", "notalking", "sleep", "relax", "relaxation", "trigger",
+    "triggers", "audio", "video", "cos", "cosplay", "jk", "vr", "hd", "uhd",
+    "bilibili", "youtube", "douyin", "tiktok", "niconico", "twitch",
+    "myspace", "vogue", "studios", "records", "official", "channel",
+    # ordinary English words that appear in titles by the thousand. The live
+    # run reported these as "brands with 36 accounts", which is nonsense: a
+    # preposition cannot be a creator.
+    "with", "full", "from", "your", "this", "that", "the", "and", "for",
+    "you", "her", "his", "she", "him", "not", "but", "all", "any", "can",
+    "will", "just", "like", "make", "made", "more", "most", "much", "very",
+    "what", "when", "where", "which", "who", "why", "how", "into", "onto",
+    "over", "under", "about", "after", "before", "again", "also", "been",
+    "being", "both", "each", "even", "ever", "every", "first", "last",
+    "less", "many", "might", "must", "need", "never", "next", "only",
+    "other", "our", "out", "own", "same", "should", "some", "still",
+    "such", "than", "them", "then", "there", "these", "they", "thing",
+    "think", "those", "through", "time", "too", "under", "until", "upon",
+    "used", "using", "want", "was", "way", "well", "were", "what", "while",
+    "with", "would", "year", "yes", "yet", "one", "two", "three", "new",
+    "old", "big", "small", "long", "short", "high", "low", "good", "best",
+    "great", "little", "right", "left", "back", "down", "here", "now",
+    "emma", "anna", "maria", "sarah", "lisa", "nina", "lena", "mia",
+}
+
+
+# English words that show up because a CJK query was translated, not because
+# the uploader wrote them. Searching 桑塔阿普亚 on YouTube returns "Santa" and
+# "Lucia"; those are search artefacts, not credits.
+_NOT_A_BRAND |= {
+    "santa", "lucia", "saint", "christmas", "happy", "merry", "music",
+    "sounds", "sound", "video", "reupload", "upload", "credit", "credits",
+    "original", "originalvideo", "subscribe", "channel", "official",
+    "democrats", "republican", "news", "live", "stream", "highlights",
+}
+
+
+def _looks_like_id(w: str) -> bool:
+    """yh-998k, ht38a5, BV1xx... -- an identifier leaked into a title.
+
+    A real brand may contain a digit (studio names rarely do, but handles
+    sometimes), so the test is shape-based: a short run of letters glued to a
+    run of digits, with no vowel-heavy word structure.
+    """
+    wl = w.strip(".-_")
+    if not any(c.isdigit() for c in wl):
+        return False
+    if re.fullmatch(r"[A-Za-z]{2,4}[-_]?\d{2,}[A-Za-z0-9]*", wl):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9]{5,}", wl) and sum(c.isdigit() for c in wl) >= 2:
+        return True
+    return False
+
+
+def brand_tokens(title: str) -> list[str]:
+    """Latin words in a Chinese title that could be a creator's brand.
+
+    Single-rule heuristics measured 0-9.2% precision on 452 real titles; the
+    only reliable signal is that a brand is repeated across DIFFERENT uploaders.
+    This returns candidates; the pool decides by cross-account frequency.
+    """
+    out = []
+    for w in re.findall(r"[A-Za-z][A-Za-z0-9_.\-]{2,}", title or ""):
+        wl = w.lower().strip(".-_")
+        if wl in _NOT_A_BRAND:
+            continue
+        # A token glued from genre words ("asmr_cos", "asmr3dio") is a tag, not
+        # a name. Split on the separator and reject when every part is a genre
+        # word -- comparing only the whole token lets the compound through.
+        parts = [x for x in re.split(r"[_\-.]", wl) if x]
+        if len(parts) > 1 and all(x in _NOT_A_BRAND for x in parts):
+            continue
+        if len(parts) > 1 and any(x.isdigit() for x in parts):
+            continue
+        # No separator to split on (asmr3dio): remove every genre word and see
+        # whether anything is left. Nothing left means it was only genre words.
+        residue = wl
+        for g in sorted(_NOT_A_BRAND, key=len, reverse=True):
+            residue = residue.replace(g, "")
+        if not residue.strip("0123456789_-."):
+            continue
+        if _looks_like_id(w):
+            continue
+        if any(ch.isdigit() for ch in wl) and len(wl) <= 5:
+            continue
+        if len(wl) < 4:
+            continue
+        # A creator brand is usually capitalised mid-title (POMEchan, PPOMO) or
+        # contains a digit/case change. A plain lowercase English word is
+        # almost always part of the sentence, not a name.
+        has_shape = (w[0].isupper() and not w.isupper()) or \
+                    any(ch.isdigit() for ch in w) or \
+                    (any(c.isupper() for c in w[1:]) and w[0].isupper())
+        if not has_shape and w.islower():
+            continue
+        out.append(w)
+    return out
+
+
+# --------------------------------------------------------------------- run
+def run(item: dict, *, net: dict, budget_s: float = 90.0, max_requests: int = 120,
+        routes: list[str] | None = None, gaps: dict[str, float] | None = None,
+        workers: int = 8, max_tasks: int = 400) -> dict:
+    """Launch every independent task at once, then follow the leads."""
+    budget = Budget(budget_s, max_requests)
+    pacer = HostPacer(gaps)
+    ledger = Ledger()
+    pool = Pool(budget, pacer, max_tasks=max_tasks, workers=workers)
+    ctx = Ctx(item, pool, budget, pacer, ledger, net=net)
+
+    t0 = time.monotonic()
+    bvid = item.get("id")
+
+    # t=0: everything that does not need another task's output.
+    seeds = []
+    if bvid:
+        seeds.append(Task.make("bili.view", bvid=bvid))
+        seeds.append(Task.make("bili.related", bvid=bvid))
+        if item.get("aid"):
+            seeds.append(Task.make("bili.comments", aid=item["aid"]))
+        if item.get("mid"):
+            seeds.append(Task.make("bili.space", mid=item["mid"], pn=1))
+        if item.get("title"):
+            # Two orders, two result sets: relevance and date overlap almost
+            # nothing. Date order is what surfaces the earlier copies.
+            for order in ("pubdate", "click"):
+                seeds.append(Task.make("bili.search", kw=item["title"],
+                                       page=1, order=order))
+            seeds.append(Task.make("yt.search", q=item["title"], n=20))
+    for s in seeds:
+        pool.spawn(s)
+
+    def worker() -> None:
+        while True:
+            task = pool.next_task()
+            if task is None:
+                return
+            fn = RUNNERS.get(task.kind)
+            if fn is None:
+                task.state = "SKIPPED"
+                task.reason = "no runner"
+                pool.finish(task)
+                continue
+            delay = pacer.reserve(task.host)
+            if delay > 0:
+                time.sleep(delay)
+            task.started_at = time.monotonic()
+            try:
+                if not budget.take(enrichment=task.enrichment):
+                    task.state = "SKIPPED"
+                    task.reason = "budget"
+                else:
+                    res = fn(task, ctx)
+                    task.result = res
+                    task.state = "DONE"
+                    ledger.absorb(res, task)
+                    # Instant dispatch: successors are appended here, on this
+                    # task's own stack, before the worker returns to the pool.
+                    for lead in res.leads:
+                        for nxt in plan(lead, task, ctx):
+                            pool.spawn(nxt)
+            except Exception as e:                  # noqa: BLE001
+                task.state = "FAILED"
+                task.error = str(e)[:200]
+                # A runner that raised did not answer the question. Whether it
+                # was a 412, a timeout or a parse error, the channel is missing
+                # from the result -- so coverage is incomplete, not clean.
+                ctx.note_blocked(task.kind, str(e))
+            finally:
+                task.ended_at = time.monotonic()
+                pool.finish(task)
+
+    threads = [threading.Thread(target=worker, name=f"w{i}", daemon=True)
+               for i in range(workers)]
+    for th in threads:
+        th.start()
+    deadline = time.monotonic() + budget_s + 10
+    for th in threads:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        th.join(timeout=left)
+
+    wall = round(time.monotonic() - t0, 1)
+    snap = ledger.snapshot()
+    brands = brand_consensus(snap["candidates"])
+    return {
+        "ok": True,
+        "input": {k: item.get(k) for k in ("platform", "id", "title", "author", "mid")},
+        "earliest_known": earliest_known(snap["candidates"], item),
+        "creator_conclusion": creator_conclusion(
+            brands, snap["candidates"], ctx.comment_name_details()),
+        "candidates": sorted(snap["candidates"], key=_rank_key),
+        "brands": brands,
+        "provenance": snap["edges"],
+        "coverage_incomplete": ctx.blocked_count() > 0,
+        "blocked_requests": ctx.blocked,
+        "diagnosis": diagnosis(
+            earliest_known(snap["candidates"], item),
+            creator_conclusion(brands, snap["candidates"],
+                               ctx.comment_name_details()),
+            ctx.blocked, len(snap["candidates"]), len(snap["edges"])),
+        "stop_reason": pool.stop_reason or "frontier_empty",
+        "wall_clock_s": wall,
+        "requests_spent": budget.spent,
+        "tasks_run": pool.done,
+        "tasks_failed": pool.failed,
+    }
+
+
+def plan(lead: dict, task: Task, ctx: Ctx) -> list[Task]:
+    """Turn a lead into successor tasks. Called from the producing stack."""
+    out = []
+    if lead.get("kind") != "brand":
+        return out
+    brand = lead["value"]
+    src = lead.get("source") or ""
+
+    # Two kinds of brand lead, two different tests.
+    #
+    # From a TITLE: the token may be genre vocabulary, so require that several
+    # unrelated uploaders repeat it before spending a search on it.
+    #
+    # From a COMMENT: a person wrote "the source is X". That is a deliberate
+    # claim about this specific video, not a statistical pattern. Requiring it
+    # to also appear in titles is wrong -- on BV1hSuV6UESm the answer existed
+    # only in the thread, because the uploader had stripped every title.
+    if src == "comments":
+        pass
+    else:
+        n = sum(1 for c in ctx.ledger.snapshot()["candidates"]
+                if brand.lower() in (c.get("title") or "").lower())
+        if n < 2:
+            return out
+
+    origin = {"src": task.id, "kind": "brand", "via": brand, "from": src}
+    out.append(Task.make("yt.search", parent=task, origin=origin,
+                         q=brand, n=20))
+    for order in ("pubdate", "click"):
+        out.append(Task.make("bili.search", parent=task, origin=origin,
+                             kw=brand, page=1, order=order))
+    return out
+
+
+def brand_consensus(cands: list[dict]) -> list[dict]:
+    """Which Latin tokens are repeated across DIFFERENT uploaders.
+
+    Ranked by cross-platform corroboration first, then by account count. A name
+    that appears in Bilibili titles AND in YouTube reuploads is far stronger
+    evidence than one repeated many times inside a single platform, where a tag
+    can spread through a repost ring in a day.
+    """
+    per: dict[str, set] = {}
+    plats: dict[str, set] = {}
+    for c in cands:
+        who = (c.get("author") or "").strip()
+        plat = c.get("platform") or "?"
+        for b in brand_tokens(c.get("title") or ""):
+            per.setdefault(b.lower(), set()).add(who)
+            plats.setdefault(b.lower(), set()).add(plat)
+    rows = []
+    for b, a in per.items():
+        if len(a) < 2:
+            continue
+        rows.append({"brand": b, "accounts": len(a),
+                     "platforms": sorted(plats.get(b, set())),
+                     "sample": sorted(a)[:4]})
+    return sorted(rows, key=lambda d: (-len(d["platforms"]), -d["accounts"]))
+
+
+def _rank_key(c: dict):
+    return (-(c.get("score") or 0), -(c.get("pubdate") or 0))
+
+
+DURATION_RATIO = (0.5, 1.6)     # a re-cut may differ, a different clip may not
+MIN_TITLE_BIGRAMS = 3
+
+# Genre vocabulary carries no identity: every ASMR title contains these, so
+# counting them as "title overlap" makes the gate accept anything. Measured on
+# a false positive: input vs an unrelated 2024 upload shared exactly
+# {AS, MR, SM, 丝袜} and passed a 3-bigram threshold.
+_GENRE_WORDS = {
+    "asmr", "助眠", "触发音", "触发", "丝袜", "黑丝", "白丝", "网袜", "油丝",
+    "蕾丝", "手套", "搓麦", "摩擦", "精油", "大腿", "耳朵", "掏耳", "采耳",
+    "耳语", "无人声", "睡眠", "按摩", "解压", "沉浸", "纯享", "福利", "cos",
+    "cosplay", "jk", "4k", "3dio", "无损", "hires", "助眠向", "哄睡", "轻语",
+    "舔耳", "口腔音", "心跳", "白噪音", "剧情", "角色扮演",
+}
+
+
+def _clean(s: str) -> str:
+    """Lowercase and drop punctuation, keeping the words themselves."""
+    return re.sub(r"[\s【】\[\]()（）_|/\\,，。、!！?？~～\-\u201c\u201d"
+                  r"\u2018\u2019&＆.0-9]+", "", (s or "").lower())
+
+
+def _bigrams(s: str) -> set[str]:
+    s = _clean(s)
+    return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) > 2 else set()
+
+
+def _distinctive(title: str, pool: list[dict], limit: int = 12) -> set[str]:
+    """Bigrams from `title` that are NOT shared with most other candidates.
+
+    A word that appears in half the pool (ASMR, 助眠, 丝袜) identifies nothing.
+    A word that appears only here (脱了放我耳朵上, 黑白蕾丝手丝搓麦) identifies
+    the work. This is document frequency, not a hand-written stoplist -- the
+    hand-written version deleted the only words worth comparing.
+    """
+    mine = _bigrams(title)
+    if not mine:
+        return set()
+    others: dict[str, int] = {}
+    for c in pool:
+        for b in _bigrams(c.get("title") or ""):
+            others[b] = others.get(b, 0) + 1
+    n = max(1, len(pool))
+    rare = {b for b in mine if others.get(b, 0) <= n * 0.25}
+    return rare or mine
+
+
+def _same_subject(cand: dict, item: dict, pool: list[dict] | None = None) -> bool:
+    """Could this candidate be the same footage? Duration and title only.
+
+    This is a GATE, not proof. Passing it means "worth calling earlier"; it
+    never means the content was verified -- that is media.verify's job, and
+    content_basis stays None until it runs.
+    """
+    d1, d2 = cand.get("duration") or 0, item.get("duration") or 0
+    if d1 and d2:
+        ratio = d1 / d2
+        if not (DURATION_RATIO[0] <= ratio <= DURATION_RATIO[1]):
+            return False
+    pool = pool or []
+    key = _distinctive(item.get("title") or "", pool)
+    if not key:
+        return False
+    shared = key & _bigrams(cand.get("title") or "")
+    # A repost of the SAME clip copies the title almost verbatim: measured
+    # 12/12 for the real copy against 3/12 for a merely similar video. So the
+    # bar is a majority, not a third -- at a third, 丝袜/发音/触发 alone let
+    # every other ASMR upload through.
+    need = max(2, (len(key) * 3 + 4) // 5)      # ceil(60%)
+    return len(shared) >= need
+
+
+def earliest_known(cands: list[dict], item: dict) -> dict:
+    """Which upload came first. Content and chronology only -- never attribution.
+
+    Without the content gate this returned the oldest unrelated video that a
+    generic title search happened to surface: 2021 instead of 2026, off by five
+    years, because sorting by pubdate alone has no notion of "same clip".
+    """
+    bili = [c for c in cands if c.get("platform") == "bilibili"
+            and c.get("pubdate") and c.get("id") != item.get("id")]
+    gated = [c for c in bili if _same_subject(c, item, bili)]
+    if not gated:
+        return {"work_id": None, "platform": "bilibili", "pubdate": None,
+                "delta_days": None, "content_basis": None,
+                "confidence": "unknown",
+                "reason": ("no candidate passed the content gate "
+                           f"({len(bili)} dated candidates were rejected)")}
+    gated.sort(key=lambda c: c["pubdate"])
+    first = gated[0]
+    return {
+        "work_id": first["id"], "platform": "bilibili",
+        "pubdate": first["pubdate"],
+        "title": first.get("title"),
+        "delta_days": round((item.get("pubdate", 0) - first["pubdate"]) / 86400, 2)
+        if item.get("pubdate") else None,
+        # Still None: the gate looked at duration and words, not at the media.
+        "content_basis": None,
+        "confidence": "likely" if len(gated) > 1 else "unknown",
+        "gated_out": len(bili) - len(gated),
+    }
+
+
+def diagnosis(earliest: dict, creator: dict, blocked: list[dict],
+              n_cands: int, n_edges: int) -> dict:
+    """Where did the chain stop? Say which step failed, not just "not found".
+
+    A bare None tells the user nothing actionable. This distinguishes:
+      - no_copy_found      the searches never surfaced an earlier upload
+      - copy_found_no_name a copy exists but nobody credited a creator
+      - name_is_a_guess    a name exists but the source hedged ("应该是")
+      - source_unreachable the creator is named but their own work is gone
+      - complete           both fields are filled
+    """
+    if creator.get("name") and earliest.get("work_id"):
+        return {"stage": "complete",
+                "detail": "earliest copy and a credited creator both found"}
+    if creator.get("name") and creator.get("level") == "guess":
+        return {"stage": "name_is_a_guess",
+                "detail": "the only name came from a hedged comment; treat as "
+                          "a lead, not an answer"}
+    if earliest.get("work_id") and not creator.get("name"):
+        return {"stage": "copy_found_no_name",
+                "detail": f"found an earlier upload ({earliest['work_id']}) "
+                          "but no candidate credits a creator"}
+    if creator.get("name"):
+        return {"stage": "source_unreachable",
+                "detail": f"{creator['name']} is named, but no work of theirs "
+                          "could be inspected to confirm it"}
+    if blocked:
+        return {"stage": "blocked",
+                "detail": f"{len(blocked)} request(s) were refused; coverage "
+                          "is incomplete, so absence is not evidence"}
+    return {"stage": "no_copy_found",
+            "detail": f"searched {n_cands} candidates over {n_edges} edges and "
+                      "found no earlier upload with matching content"}
+
+
+def creator_conclusion(brands: list[dict], cands: list[dict],
+                       comment_names: list[str] | None = None) -> dict:
+    """Who is credited as the author. Attribution only -- content is irrelevant.
+
+    A name a person wrote in the thread outranks anything derived from titles.
+    Measured failure: the thread said 桑塔阿普亚, searching that returned
+    "Santa" and "Lucia" on YouTube, and the noise displaced the real answer.
+    Derived signals must never overwrite a direct human statement.
+    """
+    details = comment_names or []
+    candidates = []
+
+    # A confident statement in the thread outranks derived signals; a hedged
+    # one does not. "桑塔阿普亚，应该是这个" is a guess and belongs below a brand
+    # that three independent uploaders actually wrote.
+    for d in details:
+        if d.get("hedged"):
+            continue
+        candidates.append({"name": d["name"], "level": "weak_lead",
+                           "source": "comments", "hedged": False,
+                           "independent_evidence_groups": 1})
+
+    # then names repeated across independent uploaders
+    for b in brands:
+        candidates.append({
+            "name": b["brand"],
+            "level": "strong_lead" if b["accounts"] >= 3 else "weak_lead",
+            "source": "titles",
+            "independent_evidence_groups": b["accounts"],
+            "sample": b.get("sample", [])[:4],
+        })
+
+    # guesses last, clearly marked
+    for d in details:
+        if d.get("hedged"):
+            candidates.append({"name": d["name"], "level": "guess",
+                               "source": "comments", "hedged": True,
+                               "independent_evidence_groups": 0})
+
+    if not candidates:
+        return {"name": None, "level": "unconfirmed",
+                "independent_evidence_groups": 0, "candidates": []}
+
+    top = candidates[0]
+    return {
+        "name": top["name"], "level": top["level"],
+        "signature_work_id": None,
+        "witness_work_id": None,
+        "brand_sources": [top["source"]],
+        "independent_evidence_groups": top["independent_evidence_groups"],
+        # Every distinct claim is kept, so a human's statement is never lost
+        # behind a search result that happened to rank first.
+        "candidates": candidates,
+    }
+
+
+def main(argv: list[str]) -> int:
+    setup_stdio()
+    if not argv:
+        print(__doc__)
+        return 2
+    target = next((a for a in argv if not a.startswith("--")), None)
+    if not target:
+        print(__doc__)
+        return 2
+    from trace_net import live_net
+    item = live_net().probe(target)
+    out = run(item, net=live_net().channels())
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
