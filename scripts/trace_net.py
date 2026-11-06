@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import unicodedata
 import urllib.parse
 import urllib.request
 
@@ -277,8 +278,15 @@ def verify_channel(cid: str, name: str) -> bool:
     html = r.body.decode("utf-8", "replace")
 
     def norm(x):
+        # NFKC first: full-width latin/digits (ｆａｎ...) must fold
+        # to ASCII BEFORE the blacklist and equality checks, otherwise norm()
+        # simply deletes them and a full-width fan-club name becomes the
+        # creator's name. Measured: ｐｏｍｅｃｈａｎ-
+        # ｆａｎ-ｃｌｕｂ normalised to plain
+        # "pomechan" with the old code.
+        x = unicodedata.normalize("NFKC", x or "")
         return re.sub(r"[^a-z0-9\u4e00-\u9fff\u3040-\u30ff]", "",
-                      (x or "").lower().replace("asmr", ""))
+                      x.lower().replace("asmr", ""))
     key = norm(name)
     if len(key) < 3:
         return False
@@ -299,7 +307,7 @@ def verify_channel(cid: str, name: str) -> bool:
         # Only the channel named in the "from <X>" position counts. A name
         # mentioned later in the description ("a tribute to <name>") is not
         # the channel's own identity.
-        raw_owner = dm.group(1)
+        raw_owner = unicodedata.normalize("NFKC", dm.group(1))
         # The site appends "on The ASMR Index ..." to the declared name. Strip
         # it, otherwise norm() glues the suffix on and substring matching lets
         # "pomechan-fan-club on The ASMR Index" pass.

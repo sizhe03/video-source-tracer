@@ -263,9 +263,11 @@ print("-- 9. diagnosis names the broken step, not just None ------------")
 _d = out.get("diagnosis") or {}
 check("a diagnosis is always emitted", bool(_d.get("stage")), str(_d))
 check("it carries a human-readable detail", bool(_d.get("detail")), str(_d))
+# Construct the guess case explicitly instead of relying on this run's out.
+_dg = T.diagnosis({"work_id": "BVx"}, {"name": "n", "level": "guess"},
+                  [], 10, 1)
 check("a guessed name is reported as a guess, not as an answer",
-      _d.get("stage") == "name_is_a_guess" or _d.get("stage") != "complete",
-      str(_d))
+      _dg["stage"] == "name_is_a_guess", str(_dg))
 
 # The removed credit_rate must not come back by accident: on the real
 # successful case it reported titles=1 because run_space never wrote `mid`,
@@ -334,8 +336,12 @@ check("no-genre witness is rejected", _c_genre.get("witness") is None,
       str(_c_genre.get("witness")))
 
 _c_ok = T.creator_conclusion(_brands, _archive_rows(_asr, True), [], [])
-check("verified + genre-consistent catalogue can confirm",
-      _c_ok["level"] == "confirmed", str(_c_ok["level"]))
+check("verified + genre-consistent catalogue yields a strong lead",
+      _c_ok["level"] == "strong_lead", str(_c_ok["level"]))
+check("the engine never claims confirmed from string evidence",
+      _c_ok["level"] != "confirmed"
+      and "confirmed" not in json.dumps(_c_ok["candidates"]),
+      "attribution proof is left to a human; strong_lead is the cap")
 
 # a guess must never be called complete
 _d = T.diagnosis({"work_id": "BVx"}, {"name": "n", "level": "guess"},

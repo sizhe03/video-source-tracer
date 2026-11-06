@@ -1271,10 +1271,11 @@ def diagnosis(earliest: dict, creator: dict, blocked: list[dict],
         return {"stage": "name_is_a_guess",
                 "detail": "the only name came from a hedged comment; treat as "
                           "a lead, not an answer"}
-    if (creator.get("name") and creator.get("level") == "confirmed"
+    if (creator.get("name") and creator.get("level") in ("strong_lead", "weak_lead")
             and earliest.get("work_id")):
         return {"stage": "complete",
-                "detail": "earliest copy and a confirmed creator both found"}
+                "detail": "earliest copy and a credited creator lead found "
+                          "(attribution is a lead, not a proof)"}
     if creator.get("name") and earliest.get("work_id"):
         return {"stage": "unconfirmed_creator",
                 "detail": f"found an earlier upload and a {creator['level']} "
@@ -1320,12 +1321,31 @@ _GENRE_LATIN = {
 _GENRE_WORD = re.compile(r"[a-z]+")
 
 
+# Words that mark a title as an instructional / non-ASMR document. If one of
+# these is present, a single ambiguous genre word no longer counts.
+_NONGENRE = {
+    "tutorial", "lesson", "lecture", "programming", "python", "sql",
+    "postgresql", "database", "guide", "review", "docs", "documentation",
+    "course", "chapter", "manual", "维修", "教程", "讲解", "评测", "开箱",
+}
+
+
 def _genre_hit(title: str) -> bool:
     low = (title or "").lower()
-    if any(g in low for g in _GENRE_CJK):
+    # Real ASMR titles almost always carry a CJK genre word or the literal
+    # ASMR token; those are unambiguous in this corpus.
+    if any(g in low for g in _GENRE_CJK) or "asmr" in _GENRE_WORD.findall(low):
         return True
     words = set(_GENRE_WORD.findall(low))
-    return bool(words & _GENRE_LATIN)
+    hits = words & _GENRE_LATIN
+    if not hits:
+        return False
+    # A lone ambiguous token (trigger / scratch / sleep) in a tutorial is not
+    # genre evidence. Require either two distinct genre tokens or no
+    # instructional context at all.
+    if len(hits) >= 2:
+        return True
+    return not (words & _NONGENRE)
 
 
 def _genre_overlap(titles: list[str]) -> int:
@@ -1383,17 +1403,26 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
                 and (c.get("archive_of") or "").lower() == nl
                 # Strict boolean: a truthy 1 / "yes" / "false" must not pass.
                 and c.get("channel_verified") is True]
-    if archived:
-        titles = [c.get("title") or "" for c in archived]
-        # The author_match branch rejects a namesake by genre. The archived
-        # branch must do the same, otherwise 25 folding-tutorial titles under
-        # a forged UC id become a "confirmed" creator.
+    # Group by channel id. Two different verified channels of the same name
+    # must never be pooled into one catalogue -- a 25+25 sum would clear the
+    # size gate while neither channel alone does.
+    by_cid: dict[str, list[dict]] = {}
+    for c in archived:
+        by_cid.setdefault(c.get("channel_id") or "unknown", []).append(c)
+    best_rows: list[dict] = []
+    best_hits = 0
+    for rows in by_cid.values():
+        titles = [r.get("title") or "" for r in rows]
         hits = _genre_overlap(titles)
-        if hits < max(1, len(titles) // 3):
-            return None
+        if hits >= max(1, len(titles) // 3) and len(rows) > len(best_rows):
+            best_rows, best_hits = rows, hits
+    if best_rows:
+        archived = best_rows
+        hits = best_hits
         return {"witness_work_id": archived[0]["id"],
                 "title": archived[0].get("title"),
                 "catalogue_size": len(archived),
+                "channel_id": archived[0].get("channel_id"),
                 "genre_matches": hits,
                 "channel_verified": all(c.get("channel_verified") is True
                                         for c in archived),
@@ -1440,6 +1469,9 @@ def known_ids(cands: list[dict], name: str | None,
             continue
         channels.append(cid)
         basis.append("archived_catalogue")
+    # Never report two different verified channels as one creator's ids.
+    if len(channels) > 1:
+        channels = []
 
     # Web handles are hints, not positively attributed ids. Keep them in a
     # separate bucket so they can never be read as "the creator's id".
@@ -1511,15 +1543,18 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
     top = candidates[0]
     wit = _witness(cands, top["name"])
     level = top["level"]
+    # The engine NEVER claims "confirmed". Seven rounds of adversarial review
+    # all found the same class of failure: string evidence (titles, meta,
+    # name matching, genre tokens) was used to declare attribution proven, and
+    # every patch only moved the bypass to a new string shape. Proving
+    # authorship requires the creator's own statement or content verification,
+    # neither of which this engine has. Cap at strong_lead -- which is exactly
+    # the "high-likelihood lead" the user asked for -- and keep the witness
+    # and ids as the evidence a human can act on.
     if (wit and wit.get("catalogue_size", 0) >= 20
-            and wit.get("genre_matches", 0) >= max(1, wit["catalogue_size"] // 3)
             and wit.get("channel_verified")
-            and level in ("strong_lead", "weak_lead")):
-        # A large, genre-consistent catalogue whose channel identity was
-        # verified is the strongest attribution obtainable without the
-        # creator's own statement. Size alone is not enough: 25 arbitrary
-        # titles under a forged UC id used to satisfy this.
-        level = "confirmed"
+            and level == "weak_lead"):
+        level = "strong_lead"
     return {
         "name": top["name"], "level": level,
         "witness": wit,
