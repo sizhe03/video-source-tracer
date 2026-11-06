@@ -455,6 +455,42 @@ check("name-prefix is stripped before extraction",
       str(T._comment_names("应该是桑塔阿普亚")))
 
 print()
+print("-- 15. round-4 attack surfaces are closed -----------------------")
+check("'asmr' as a latin substring does not match Chasmrlings",
+      T._genre_hit("Chasmrlings tutorial") is False)
+check("'No.' in a tutorial title is not a genre hit",
+      T._genre_hit("Learn Python No. 1: Heart of the Year") is False)
+_en = ["Chapter %d: Learn Python, No. %d, Heart of the Year" % (i, i)
+       for i in range(9)] + ["Learn origami crane tutorial %d" % i for i in range(16)]
+check("25 english tutorials with 'No.' cannot pass the genre gate",
+      T._genre_overlap(_en) < max(1, 25 // 3), str(T._genre_overlap(_en)))
+check("CJK ASMR titles still pass", T._genre_hit("ASMR 丝袜 助眠") is True)
+check("longest name prefix wins",
+      "桑塔阿普亚" in T._comment_names("应该是这个桑塔阿普亚"),
+      str(T._comment_names("应该是这个桑塔阿普亚")))
+
+_real_desc = ('<meta property="og:description" content="Watch all 239 ASMR '
+              'videos from POMEchan on The ASMR Index">'
+              + "".join('<a href="x" title="Watch 【4KASMR】睡眠導入 太もも %d">' % i
+                        for i in range(12)))
+_fake_desc = ('<meta property="og:description" content="Watch all 25 ASMR '
+              'videos from AnotherCreator; see also pomechan">'
+              + "".join('<a href="x" title="Watch 【4KASMR】睡眠導入 太もも %d">' % i
+                        for i in range(12)))
+_o2 = _TN2.http
+class _DResp:
+    status = 200
+    def __init__(self, body): self.body = body.encode()
+_TN2.http = lambda *a, **k: _DResp(_real_desc)
+check("a channel declaring itself is verified",
+      _TN2.verify_channel("UC1Y-RkDrol_nyXk7vx8wgUA", "pomechan") is True)
+_TN2.http = lambda *a, **k: _DResp(_fake_desc)
+check("a page that only MENTIONS the name is not verified",
+      _TN2.verify_channel("UC9999999999999999999999", "pomechan") is False,
+      "the name must appear in the 'from <channel>' position")
+_TN2.http = _o2
+
+print()
 bad = [n for n, c in R if not c]
 print(f"{len(R) - len(bad)}/{len(R)} checks passed")
 sys.exit(1 if bad else 0)

@@ -292,19 +292,27 @@ def verify_channel(cid: str, name: str) -> bool:
             r'<meta[^>]+(?:name|property)="(?:description|og:description)"'
             r'[^>]+content="([^"]{10,400})"', html, re.I):
         desc = m.group(1)
-        if not re.search(r"\d+\s*ASMR\s*videos\s*from", desc, re.I):
+        dm = re.search(r"\d+\s*ASMR\s*videos\s*from\s+([^.;,]{2,80})",
+                       desc, re.I)
+        if not dm:
             continue
-        # the declared channel name must contain the name we are verifying
-        if key in norm(desc) or key in norm(desc.split(" from ")[-1]):
+        # Only the channel named in the "from <X>" position counts. A name
+        # mentioned later in the description ("a tribute to <name>") is not
+        # the channel's own identity.
+        owner = norm(dm.group(1))
+        if key and (key in owner or owner in key) and len(owner) >= 3:
             declared = True
             break
     if not declared:
         return False
 
-    # Genre self-check on the page's own video titles: a namesake channel of
-    # music or programming tutorials must not pass even with a similar name.
-    titles = re.findall(r'class="video-card__title"[^>]*>\s*<a[^>]*>'
-                        r'([^<]{3,200})', html)
+    # Genre self-check on the page's own video titles. Parse BOTH shapes the
+    # site uses: archive_channel reads href=...title="Watch ...", while some
+    # pages use class="video-card__title". If only the first shape is present
+    # the old regex returned [] and skipped this check entirely.
+    titles = re.findall(r'title="Watch ([^"]{3,200})"', html)
+    titles += re.findall(r'class="video-card__title"[^>]*>\s*<a[^>]*>'
+                         r'([^<]{3,200})', html)
     if titles:
         asmrish = sum(1 for t in titles
                       if re.search(r"asmr|睡眠導入|sleep|trigger|scratch|"

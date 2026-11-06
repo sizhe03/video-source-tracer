@@ -599,9 +599,9 @@ def _is_hedged(text: str) -> bool:
 # the role/hedge prefix glued to the name and shifted the CJK run. Remove the
 # leading attribution phrase before tokenising.
 _NAME_PREFIX = re.compile(
-    r"^(?:原作者|原创|作者|原up|up主|转载自|搬运自|应该是|应该是这个|"
-    r"好像是|可能是|大概是|估计是|似乎是|是不是|应该|大概|估计|似乎|"
-    r"这是|这个是|是|叫|@)+[\s:：,，。、]*")
+    r"^(?:应该是这个|应该是|好像是|可能是|大概是|估计是|似乎是|是不是|"
+    r"大概原作者是|原作者是|原作者|原创|作者|原up|up主|转载自|搬运自|"
+    r"应该|大概|估计|似乎|这是|这个是|是|叫|@)+[\s:：,，。、]*")
 
 
 def _comment_names(text: str) -> list[str]:
@@ -1286,16 +1286,21 @@ def diagnosis(earliest: dict, creator: dict, blocked: list[dict],
 # CJK genre words are matched as substrings (Chinese has no spaces). Latin
 # words must match as WHOLE words -- a bare "ear" matched Learn, Early, Heart,
 # Clear, Gear, Year and let 25 Python tutorials pass as ASMR titles.
+# CJK words have no spaces, so substring is correct for them. "ASMR" is NOT
+# here: as a CJK substring it matched "Chasmrlings tutorial". Latin genre
+# words are matched as whole tokens below.
 _GENRE_CJK = {
     "助眠", "触发音", "触发", "丝袜", "耳朵", "掏耳", "采耳", "按摩",
     "精油", "大腿", "摩擦", "耳语", "睡眠", "睡眠導入", "オイル",
-    "スクランチ", "睡眠導入", "ASMR", "asmr",
+    "スクランチ",
 }
+# "no" removed: it matched "No. 1" in any tutorial title. "talking" /
+# "notalking" alone do not identify the genre either.
 _GENRE_LATIN = {
-    "asmr", "sleep", "relax", "relaxation", "tingle", "tingles",
+    "asmr", "sleep", "sleeping", "relax", "relaxation", "tingle", "tingles",
     "massage", "trigger", "triggers", "whisper", "whispers", "scratch",
-    "scratching", "tapping", "oil", "thigh", "thighs", "foot", "feet",
-    "no", "talking", "notalking",
+    "scratching", "tapping", "oil", "oiled", "thigh", "thighs", "foot",
+    "feet", "trigger", "asmr",
 }
 _GENRE_WORD = re.compile(r"[a-z]+")
 
