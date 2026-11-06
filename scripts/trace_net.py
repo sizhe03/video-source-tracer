@@ -167,14 +167,54 @@ def reverse_image(url: str) -> list[dict]:
     return out[:50]
 
 
+def archive_channel(cid: str, pages: int = 20) -> list[dict]:
+    """Enumerate a deleted channel from theasmrindex's archive.
+
+    Verified: GET /channel/UC1Y-RkDrol_nyXk7vx8wgUA returns 200 / 101530 bytes
+    with "all 239 ASMR videos" in the meta, paginated 12 per page, page 21 404s.
+    The /search endpoint on that site ignores its query entirely, so only the
+    channel route is usable.
+    """
+    out = []
+    for page in range(1, pages + 1):
+        url = f"https://theasmrindex.com/channel/{cid}"
+        if page > 1:
+            url += f"?page={page}"
+        try:
+            r = http(url, timeout=25, headers=DESKTOP)
+        except Exception:                           # noqa: BLE001
+            break
+        if r.status != 200:
+            break
+        page_html = r.body.decode("utf-8", "replace")
+        found = 0
+        for m in re.finditer(r'href="/video/([A-Za-z0-9_-]{11})"[^>]*>([^<]{3,200})<',
+                             page_html):
+            out.append({"id": m.group(1), "title": m.group(2).strip()})
+            found += 1
+        if not found:
+            break
+    # de-dup by id, preserving order
+    seen, uniq = set(), []
+    for r in out:
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            uniq.append(r)
+    return uniq
+
+
 class LiveNet:
     """Bundles the real channels and the input probe."""
 
     def channels(self) -> dict:
+        # Every kind declared in trace.HOST_OF must appear here or its runner
+        # raises KeyError. The confirmation channels (reverse_image,
+        # archive_channel) were missing from the engine entirely.
         return {"view": view, "related": related, "space": space,
                 "search": search, "comments": comments, "ytsearch": ytsearch,
                 "ytchannel": ytchannel, "ytoembed": ytoembed,
-                "reverse_image": reverse_image}
+                "reverse_image": reverse_image,
+                "archive_channel": archive_channel}
 
     def probe(self, target: str) -> dict:
         """Resolve a URL or bare id into the item dict trace.run() expects."""

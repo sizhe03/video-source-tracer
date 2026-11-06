@@ -416,6 +416,10 @@ class Ctx:
 
 RUNNERS: dict[str, Runner] = {}
 
+# Kinds that are declared for completeness but never dispatched today. Listing
+# them explicitly means the check in run() still catches an accidental gap.
+_INTENTIONALLY_EMPTY = {"cover.phash", "media.verify", "alias.expand", "rank"}
+
 
 def runner(kind: str):
     def deco(fn: Runner) -> Runner:
@@ -444,6 +448,13 @@ def run_view(task: Task, ctx: Ctx) -> TaskResult:
         "pubdate": d.get("pubdate") or 0,
         "duration": d.get("duration") or 0,
     }])
+    cover = d.get("pic")
+    if cover:
+        # Declared in HOST_OF but never dispatched -- the confirmation channel
+        # that reaches platforms the title search cannot.
+        ctx.pool.spawn(Task.make("image.reverse", parent=task,
+                                 origin={"src": task.id, "kind": "cover"},
+                                 url=cover))
     owner = d.get("owner") or {}
     if owner.get("mid"):
         # An uploader's own timeline is the cheapest place a repost leaves the
@@ -568,18 +579,143 @@ def _comment_names(text: str) -> list[str]:
     return _short_tokens(text)
 
 
+_CHANNEL_ID = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+
+
 @runner("yt.search")
 def run_yt_search(task: Task, ctx: Ctx) -> TaskResult:
     hits = ctx.net["ytsearch"](task.params["q"], task.params.get("n", 20))
     cands = []
     for e in hits or []:
+        vid = e.get("id") or ""
+        author = e.get("channel") or e.get("uploader")
+        # A search can return a CHANNEL (UC + 22 chars). Stored as a video it
+        # pollutes the table; stored as a channel it is the witness we need, so
+        # enumerate its uploads instead.
+        if _CHANNEL_ID.match(vid):
+            ctx.pool.spawn(Task.make("yt.channel", parent=task,
+                                     origin={"src": task.id, "kind": "channel",
+                                             "via": author},
+                                     cid=vid, name=author, limit=200))
+            ctx.pool.spawn(Task.make("archive.channel", parent=task,
+                                     origin={"src": task.id, "kind": "channel",
+                                             "via": author},
+                                     cid=vid, name=author))
+            continue
         cands.append({
-            "platform": "youtube", "id": e.get("id"),
+            "platform": "youtube", "id": vid,
             "title": _strip_tags(e.get("title") or ""),
-            "author": e.get("channel") or e.get("uploader"),
+            "author": author,
             "pubdate": 0, "duration": int(e.get("duration") or 0) or 0,
         })
     return TaskResult(candidates=cands)
+
+
+@runner("yt.oembed")
+def run_yt_oembed(task: Task, ctx: Ctx) -> TaskResult:
+    """Authoritative title + channel for a bare video id.
+
+    Reverse image search returns ids without metadata; this turns one into a
+    named channel so the creator can be checked.
+    """
+    vid = task.params.get("vid")
+    if not vid:
+        return TaskResult(note="no video id")
+    try:
+        j = ctx.net["ytoembed"](vid)
+    except Exception as e:                          # noqa: BLE001
+        ctx.note_blocked("yt.oembed", str(e))
+        return TaskResult(note=f"oembed failed: {e}")
+    return TaskResult(candidates=[{
+        "platform": "youtube", "id": vid,
+        "title": j.get("title"), "author": j.get("author_name"),
+        "pubdate": 0, "duration": 0,
+    }], evidence={"channel_url": j.get("author_url")})
+
+
+@runner("image.reverse")
+def run_image_reverse(task: Task, ctx: Ctx) -> TaskResult:
+    """Reverse-search the cover. Reaches platforms the title search cannot.
+
+    Verified by hand in FINAL.md C7: a bilibili cover returned a YouTube video
+    id that no title query ever surfaced. This runner was declared in HOST_OF
+    but never written, so the whole channel was dead code.
+    """
+    url = task.params.get("url")
+    if not url:
+        return TaskResult(note="no cover url")
+    try:
+        hits = ctx.net["reverse_image"](url)
+    except Exception as e:                          # noqa: BLE001
+        ctx.note_blocked("image.reverse", str(e))
+        return TaskResult(note=f"reverse image failed: {e}")
+    cands = []
+    for h in hits or []:
+        u = h.get("url") or ""
+        m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", u)
+        if m:
+            vid = m.group(1)
+            cands.append({"platform": "youtube", "id": vid,
+                          "title": None, "author": None, "pubdate": 0,
+                          "duration": 0})
+            # The id alone names nobody; oembed is what turns it into a creator.
+            ctx.pool.spawn(Task.make("yt.oembed", parent=task,
+                                     origin={"src": task.id, "kind": "image",
+                                             "via": vid},
+                                     vid=vid))
+            continue
+        m = re.search(r"(BV[0-9A-Za-z]{10})", u)
+        if m:
+            cands.append({"platform": "bilibili", "id": m.group(1),
+                          "title": None, "author": None, "pubdate": 0,
+                          "duration": 0})
+    return TaskResult(candidates=cands,
+                      evidence={"image_hits": len(hits or [])})
+
+
+@runner("archive.channel")
+def run_archive_channel(task: Task, ctx: Ctx) -> TaskResult:
+    """Enumerate a DELETED YouTube channel from a third-party archive.
+
+    POMEchan's channel returns "removed for violating Community Guidelines";
+    theasmrindex still serves /channel/<UCID> with all 239 titles. Without this
+    a named-but-deleted creator can never be confirmed, which is exactly the
+    state BV1rCxf6MERM was stuck in.
+    """
+    cid = task.params.get("cid")
+    if not cid:
+        return TaskResult(note="no channel id")
+    try:
+        rows = ctx.net["archive_channel"](cid)
+    except Exception as e:                          # noqa: BLE001
+        ctx.note_blocked("archive.channel", str(e))
+        return TaskResult(note=f"archive failed: {e}")
+    cands = []
+    for r in rows or []:
+        cands.append({"platform": "youtube", "id": r.get("id"),
+                      "title": r.get("title"), "author": task.params.get("name"),
+                      "pubdate": 0, "duration": 0})
+    return TaskResult(candidates=cands,
+                      evidence={"archived_titles": len(cands)})
+
+
+@runner("yt.channel")
+def run_yt_channel(task: Task, ctx: Ctx) -> TaskResult:
+    """Enumerate a live creator's own uploads (the witness_work_id source)."""
+    cid = task.params.get("cid")
+    if not cid:
+        return TaskResult(note="no channel id")
+    try:
+        rows = ctx.net["ytchannel"](cid, task.params.get("limit", 200))
+    except Exception as e:                          # noqa: BLE001
+        ctx.note_blocked("yt.channel", str(e))
+        return TaskResult(note=f"channel failed: {e}")
+    cands = [{"platform": "youtube", "id": r.get("id"), "title": r.get("title"),
+              "author": task.params.get("name"), "pubdate": 0,
+              "duration": int(r.get("duration") or 0) or 0}
+             for r in rows or []]
+    return TaskResult(candidates=cands,
+                      evidence={"channel_titles": len(cands)})
 
 
 def _secs(d) -> int:
@@ -701,6 +837,14 @@ def run(item: dict, *, net: dict, budget_s: float = 90.0, max_requests: int = 12
         routes: list[str] | None = None, gaps: dict[str, float] | None = None,
         workers: int = 8, max_tasks: int = 400) -> dict:
     """Launch every independent task at once, then follow the leads."""
+    # A kind in HOST_OF with no runner is silently skipped at execution time.
+    # That is how image.reverse and archive.channel -- the entire confirmation
+    # layer -- stayed dead while the tests stayed green. Refuse to start.
+    unimplemented = sorted(set(HOST_OF) - set(RUNNERS) - _INTENTIONALLY_EMPTY)
+    if unimplemented:
+        raise RuntimeError(
+            f"declared task kinds with no runner: {unimplemented}. "
+            "Implement them or list them in _INTENTIONALLY_EMPTY.")
     budget = Budget(budget_s, max_requests)
     pacer = HostPacer(gaps)
     ledger = Ledger()
@@ -835,6 +979,10 @@ def plan(lead: dict, task: Task, ctx: Ctx) -> list[Task]:
     origin = {"src": task.id, "kind": "brand", "via": brand, "from": src}
     out.append(Task.make("yt.search", parent=task, origin=origin,
                          q=brand, n=20))
+    # If the creator's channel turns out to be deleted, the archive runner is
+    # the only way to reach their own work and upgrade a lead to confirmed.
+    out.append(Task.make("archive.channel", parent=task, origin=origin,
+                         name=brand, cid=None))
     for order in ("pubdate", "click"):
         out.append(Task.make("bili.search", parent=task, origin=origin,
                              kw=brand, page=1, order=order))
@@ -1009,6 +1157,57 @@ def diagnosis(earliest: dict, creator: dict, blocked: list[dict],
                       "found no earlier upload with matching content"}
 
 
+# Words that mark a channel as belonging to this genre. A witness channel must
+# share some of them; a namesake musician shares none.
+_GENRE_HINT = {
+    "asmr", "助眠", "触发音", "触发", "丝袜", "耳朵", "掏耳", "采耳", "按摩",
+    "精油", "大腿", "摩擦", "耳语", "睡眠", "sleep", "relax", "tingle",
+    "massage", "trigger", "whisper", "ear",
+}
+
+
+def _genre_overlap(titles: list[str]) -> int:
+    hits = 0
+    for tt in titles:
+        low = (tt or "").lower()
+        if any(g in low for g in _GENRE_HINT):
+            hits += 1
+    return hits
+
+
+def _witness(cands: list[dict], name: str | None) -> dict | None:
+    """A work of the NAMED creator, verified by CONTENT, not by name.
+
+    Measured failure: searching for POMEchan surfaced a channel called
+    "Pome-chan" whose 11 uploads are all music (Pastel Room, Nyan cat remix,
+    太鼓の達人). It is a namesake. A name match alone would have reported it as
+    the creator's own catalogue and upgraded the lead to confirmed -- the exact
+    mistake this project exists to avoid.
+
+    A witness channel must share genre vocabulary with the input. If it does
+    not, it is a different person who happens to share a name.
+    """
+    if not name:
+        return None
+    nl = name.lower()
+    by_author: dict[str, list[dict]] = {}
+    for c in cands:
+        who = (c.get("author") or "")
+        wl = who.lower()
+        if wl and (nl in wl or wl in nl):
+            by_author.setdefault(who, []).append(c)
+    for who, rows in by_author.items():
+        titles = [r.get("title") or "" for r in rows]
+        if _genre_overlap(titles) < max(1, len(titles) // 3):
+            # namesake: same name, different subject matter
+            continue
+        best = rows[0]
+        return {"witness_work_id": best["id"], "title": best.get("title"),
+                "author": who, "catalogue_size": len(rows),
+                "genre_matches": _genre_overlap(titles)}
+    return None
+
+
 def creator_conclusion(brands: list[dict], cands: list[dict],
                        comment_names: list[str] | None = None) -> dict:
     """Who is credited as the author. Attribution only -- content is irrelevant.
@@ -1053,8 +1252,15 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
                 "independent_evidence_groups": 0, "candidates": []}
 
     top = candidates[0]
+    wit = _witness(cands, top["name"])
+    level = top["level"]
+    if wit and level in ("strong_lead", "weak_lead"):
+        # We found the creator's own upload. That does not prove authorship of
+        # the input, but it does mean the name is attached to a real catalogue.
+        level = "strong_lead" if level == "strong_lead" else level
     return {
-        "name": top["name"], "level": top["level"],
+        "name": top["name"], "level": level,
+        "witness": wit,
         "signature_work_id": None,
         "witness_work_id": None,
         "brand_sources": [top["source"]],
