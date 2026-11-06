@@ -296,6 +296,12 @@ def verify_channel(cid: str, name: str) -> bool:
     return False
 
 
+def _thread_comments(aid: int):
+    """(thread, meta) from comments.py, matching what run_comments consumes."""
+    import comments as C
+    return C.fetch_comments(aid)
+
+
 def archive_channel(cid: str, pages: int = 20) -> list[dict]:
     """Enumerate a deleted channel from theasmrindex's archive.
 
@@ -352,7 +358,10 @@ class LiveNet:
                 "resolve_channel": resolve_channel,
                 "websearch": websearch,
                 "verify_channel": verify_channel,
-                "fetch_comments": comments}
+                # run_comments expects (thread, meta). comments() above is the
+                # raw reply/main endpoint and returns a dict, so bind the
+                # thread reader instead.
+                "fetch_comments": _thread_comments}
 
     def probe(self, target: str) -> dict:
         """Resolve a URL or bare id into the item dict trace.run() expects."""

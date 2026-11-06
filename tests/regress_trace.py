@@ -389,6 +389,24 @@ check("main parses --budget and --max-requests",
       "documented flags must not be ignored")
 
 print()
+print("-- 13. the comment channel is wired to the thread reader -------")
+_fc = _TN2.LiveNet().channels().get("fetch_comments")
+check("fetch_comments is registered", _fc is not None)
+# A real call must return a (thread, meta) pair, not a raw reply/main dict.
+# Use the known input aid from the reference case; the response may be empty
+# offline, but the SHAPE is what regressed.
+try:
+    _r = _fc(117060860386981) if _fc else None
+    check("fetch_comments returns (thread, meta)",
+          isinstance(_r, tuple) and len(_r) == 2, str(type(_r)))
+except Exception as _e:                              # noqa: BLE001
+    # Network failure is acceptable here; a wrong return shape is not.
+    check("fetch_comments returns (thread, meta)",
+          "fetch" in str(_e).lower() or "network" in str(_e).lower()
+          or "412" in str(_e) or "urlopen" in str(_e).lower(),
+          f"unexpected failure: {_e}")
+
+print()
 bad = [n for n, c in R if not c]
 print(f"{len(R) - len(bad)}/{len(R)} checks passed")
 sys.exit(1 if bad else 0)
