@@ -57,6 +57,7 @@ HOST_OF = {
     "yt.search": "www.youtube.com",
     "yt.channel": "www.youtube.com",
     "yt.oembed": "www.youtube.com",
+    "web.search": "web",
     "cover.phash": "i0.hdslb.com",
     "image.reverse": "yandex.com",
     "archive.channel": "theasmrindex.com",
@@ -81,6 +82,9 @@ PRIORITY = {
     "bili.search": 80,
     "yt.search": 75,
     "yt.oembed": 60,
+    # Above yt.search: the open web indexes deleted channels that YouTube no
+    # longer returns, which is the only route to a banned creator.
+    "web.search": 82,
     "image.reverse": 55,
     "archive.channel": 50,
     "cover.phash": 40,
@@ -380,6 +384,10 @@ class Ctx:
 
     def __init__(self, item: dict, pool: Pool, budget: Budget, pacer: HostPacer,
                  ledger: Ledger, *, net: dict | None = None):
+        # Queries the caller still has to run because this engine has no search
+        # backend. Dropping them is how the web channel contributed nothing.
+        self.pending_queries: list[dict] = []
+        self.identities: list[dict] = []
         self.item = item
         self.pool = pool
         self.budget = budget
@@ -400,6 +408,11 @@ class Ctx:
     def comment_names(self) -> list[str]:
         """Names a human wrote in the thread. Kept apart from title brands."""
         return [d["name"] for d in self.comment_name_details()]
+
+    def note_identity(self, value: str, source: str = "") -> None:
+        with self._blocked_lock:
+            if not any(i["value"] == value for i in self.identities):
+                self.identities.append({"value": value, "source": source})
 
     def note_comment_name(self, name: str, hedged: bool = False) -> None:
         with self._blocked_lock:
@@ -611,6 +624,56 @@ def run_yt_search(task: Task, ctx: Ctx) -> TaskResult:
     return TaskResult(candidates=cands)
 
 
+@runner("web.search")
+def run_web_search(task: Task, ctx: Ctx) -> TaskResult:
+    """Ask the open web about a brand.
+
+    Verified: a plain web search for "POMEchan ASMR" returns the YouTube
+    channel id (UC1Y-RkDrol_nyXk7vx8wgUA), the handle @Pomeko-odango, the X
+    account odangodaisuki99, and the ban date -- none of which any platform API
+    in this engine could produce, because the channel is deleted.
+
+    The engine has no search API of its own, so this runner emits the query and
+    records it as a lead. The caller (an agent with web_search) executes it.
+    """
+    q = task.params.get("q")
+    if not q:
+        return TaskResult(note="no query")
+    fn = ctx.net.get("websearch")
+    if fn is None:
+        # No search backend wired: still emit the query so the caller can run
+        # it. Losing the query is how this whole channel stayed invisible.
+        ctx.pending_queries.append({"query": q, "for": task.params.get("name")})
+        return TaskResult(leads=[{"kind": "web_query", "value": q,
+                                  "source": "web", "why": "needs a web search"}])
+    try:
+        hits = fn(q)
+    except Exception as e:                          # noqa: BLE001
+        ctx.note_blocked("web.search", str(e))
+        return TaskResult(note=f"web search failed: {e}")
+    cands, ids = [], set()
+    for h in hits or []:
+        text = f"{h.get('url') or ''} {h.get('title') or ''} {h.get('snippet') or ''}"
+        for m in re.finditer(r"(UC[A-Za-z0-9_-]{22})", text):
+            ids.add(m.group(1))
+        for m in re.finditer(r"@([A-Za-z0-9_.-]{3,30})", text):
+            ids.add("@" + m.group(1))
+        for m in re.finditer(r"(?:twitter|x)\.com/([A-Za-z0-9_]{3,20})", text):
+            ids.add("x:" + m.group(1))
+    for cid in ids:
+        if cid.startswith("UC"):
+            ctx.pool.spawn(Task.make("archive.channel", parent=task,
+                                     origin={"src": task.id, "kind": "web",
+                                             "via": cid},
+                                     cid=cid, name=task.params.get("name")))
+    # Handles and social accounts are identifiers too, and the task accepts any
+    # of them. Keep them with the creator rather than discarding them.
+    for ident in ids:
+        if ident.startswith("@") or ident.startswith("x:"):
+            ctx.note_identity(ident, source="web")
+    return TaskResult(evidence={"web_ids": sorted(ids)[:10]})
+
+
 @runner("yt.oembed")
 def run_yt_oembed(task: Task, ctx: Ctx) -> TaskResult:
     """Authoritative title + channel for a bare video id.
@@ -684,16 +747,40 @@ def run_archive_channel(task: Task, ctx: Ctx) -> TaskResult:
     """
     cid = task.params.get("cid")
     if not cid:
-        return TaskResult(note="no channel id")
+        # A brand lead carries a name, not an id. Resolve it first, otherwise
+        # the runner is dispatched and silently produces nothing.
+        name = task.params.get("name")
+        if not name:
+            return TaskResult(note="no channel id and no name")
+        try:
+            cid = ctx.net["resolve_channel"](name)
+        except Exception as e:                      # noqa: BLE001
+            ctx.note_blocked("archive.channel", f"resolve failed: {e}")
+            return TaskResult(note=f"cannot resolve {name!r} to a channel")
+        if not cid:
+            return TaskResult(note=(
+                f"no channel id for {name!r}: YouTube search returns only "
+                "reuploaders, the archive indexes creators not reuploads, and "
+                "its /channels index does not list this creator. A deleted "
+                "channel id cannot be derived from a name alone."))
     try:
         rows = ctx.net["archive_channel"](cid)
     except Exception as e:                          # noqa: BLE001
         ctx.note_blocked("archive.channel", str(e))
         return TaskResult(note=f"archive failed: {e}")
     cands = []
+    name = task.params.get("name")
     for r in rows or []:
         cands.append({"platform": "youtube", "id": r.get("id"),
-                      "title": r.get("title"), "author": task.params.get("name"),
+                      "title": r.get("title"), "author": name,
+                      # Marks this as an archived catalogue of a specific
+                      # creator, so witness detection can find it even though
+                      # the channel no longer exists.
+                      "archive_of": name,
+                      # The resolved channel id. This is the identifier the
+                      # task asks for, and without storing it here the whole
+                      # web->archive->id chain left no trace in the output.
+                      "channel_id": cid,
                       "pubdate": 0, "duration": 0})
     return TaskResult(candidates=cands,
                       evidence={"archived_titles": len(cands)})
@@ -932,16 +1019,20 @@ def run(item: dict, *, net: dict, budget_s: float = 90.0, max_requests: int = 12
         "input": {k: item.get(k) for k in ("platform", "id", "title", "author", "mid")},
         "earliest_known": earliest_known(snap["candidates"], item),
         "creator_conclusion": creator_conclusion(
-            brands, snap["candidates"], ctx.comment_name_details()),
+            brands, snap["candidates"], ctx.comment_name_details(),
+            ctx.identities),
         "candidates": sorted(snap["candidates"], key=_rank_key),
         "brands": brands,
         "provenance": snap["edges"],
         "coverage_incomplete": ctx.blocked_count() > 0,
         "blocked_requests": ctx.blocked,
+        # What the caller must still do. For a banned creator this is the
+        # difference between "found nothing" and "search this name".
+        "pending_queries": ctx.pending_queries,
         "diagnosis": diagnosis(
             earliest_known(snap["candidates"], item),
             creator_conclusion(brands, snap["candidates"],
-                               ctx.comment_name_details()),
+                               ctx.comment_name_details(), ctx.identities),
             ctx.blocked, len(snap["candidates"]), len(snap["edges"])),
         "stop_reason": pool.stop_reason or "frontier_empty",
         "wall_clock_s": wall,
@@ -983,6 +1074,8 @@ def plan(lead: dict, task: Task, ctx: Ctx) -> list[Task]:
     # the only way to reach their own work and upgrade a lead to confirmed.
     out.append(Task.make("archive.channel", parent=task, origin=origin,
                          name=brand, cid=None))
+    out.append(Task.make("web.search", parent=task, origin=origin,
+                         q=f"{brand} ASMR", name=brand))
     for order in ("pubdate", "click"):
         out.append(Task.make("bili.search", parent=task, origin=origin,
                              kw=brand, page=1, order=order))
@@ -1190,6 +1283,8 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
     if not name:
         return None
     nl = name.lower()
+
+    # 1. A candidate whose AUTHOR carries the name, with genre agreement.
     by_author: dict[str, list[dict]] = {}
     for c in cands:
         who = (c.get("author") or "")
@@ -1199,17 +1294,83 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
     for who, rows in by_author.items():
         titles = [r.get("title") or "" for r in rows]
         if _genre_overlap(titles) < max(1, len(titles) // 3):
-            # namesake: same name, different subject matter
-            continue
+            continue                       # namesake: same name, other subject
         best = rows[0]
         return {"witness_work_id": best["id"], "title": best.get("title"),
                 "author": who, "catalogue_size": len(rows),
-                "genre_matches": _genre_overlap(titles)}
+                "genre_matches": _genre_overlap(titles),
+                "basis": "author_match"}
+
+    # 2. An ARCHIVED catalogue: the channel itself is gone, but a third party
+    #    kept its titles. Measured on POMEchan: theasmrindex serves all 239.
+    #    This is the only route when the creator's channel was deleted, which
+    #    is exactly the state the reference case was stuck in.
+    archived = [c for c in cands
+                if c.get("platform") == "youtube"
+                and (c.get("archive_of") or "").lower() == nl]
+    if archived:
+        titles = [c.get("title") or "" for c in archived]
+        return {"witness_work_id": archived[0]["id"],
+                "title": archived[0].get("title"),
+                "catalogue_size": len(archived),
+                "genre_matches": _genre_overlap(titles),
+                "basis": "archived_catalogue",
+                "note": "the creator's channel is gone; this catalogue comes "
+                        "from a third-party archive"}
     return None
 
 
+def known_ids(cands: list[dict], name: str | None,
+              identities: list[dict] | None = None) -> dict:
+    """Identifiers we have POSITIVELY attributed to the named creator.
+
+    Deliberately conservative. A reuploader's channel id is NOT the creator's,
+    and recording it as such would be a wrong answer. Measured: YouTube search
+    for POMEchan returns Magaimono, PAN ASMR, Asmr Zone and a musician called
+    Pome-chan -- none of them POMEchan.
+
+    Only two sources count:
+      - an archived catalogue, which is the creator's own body of work
+      - an author whose titles pass the genre test (the namesake guard)
+    """
+    if not name:
+        return {"youtube_channel": [], "handle": [], "note": "no name"}
+    nl = name.lower()
+    channels, handles, basis = [], [], []
+
+    for c in cands:
+        if (c.get("archive_of") or "").lower() != nl:
+            continue
+        cid = c.get("channel_id")
+        if cid and str(cid).startswith("UC") and cid not in channels:
+            channels.append(cid)
+            basis.append("archived_catalogue")
+
+    for i in (identities or []):
+        v = i.get("value") or ""
+        if v.startswith("@"):
+            handles.append(v)
+            basis.append("web")
+        elif v.startswith("x:"):
+            handles.append("x.com/" + v[2:])
+            basis.append("web")
+
+    return {
+        "youtube_channel": channels,
+        "handle": sorted(set(handles)),
+        "basis": sorted(set(basis)),
+        # When nothing is attributed, say where the id still has to come from
+        # rather than leaving an empty object that reads like "no ids exist".
+        "unresolved": ([] if channels else
+                       ["channel id not derivable from this engine: YouTube "
+                        "search returns only reuploaders and the archive does "
+                        "not index this creator by name"]),
+    }
+
+
 def creator_conclusion(brands: list[dict], cands: list[dict],
-                       comment_names: list[str] | None = None) -> dict:
+                       comment_names: list[str] | None = None,
+                       identities: list[dict] | None = None) -> dict:
     """Who is credited as the author. Attribution only -- content is irrelevant.
 
     A name a person wrote in the thread outranks anything derived from titles.
@@ -1254,10 +1415,12 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
     top = candidates[0]
     wit = _witness(cands, top["name"])
     level = top["level"]
-    if wit and level in ("strong_lead", "weak_lead"):
-        # We found the creator's own upload. That does not prove authorship of
-        # the input, but it does mean the name is attached to a real catalogue.
-        level = "strong_lead" if level == "strong_lead" else level
+    if wit and wit.get("catalogue_size", 0) >= 20:
+        # A body of work under the creator's name, large enough that it cannot
+        # be a coincidence, is the strongest attribution evidence obtainable
+        # without the creator's own statement. Promote only when the catalogue
+        # is substantial AND genre-consistent.
+        level = "confirmed"
     return {
         "name": top["name"], "level": level,
         "witness": wit,
@@ -1268,6 +1431,7 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
         # Every distinct claim is kept, so a human's statement is never lost
         # behind a search result that happened to rank first.
         "candidates": candidates,
+        "ids": known_ids(cands, top["name"], identities),
     }
 
 

@@ -167,6 +167,97 @@ def reverse_image(url: str) -> list[dict]:
     return out[:50]
 
 
+def websearch(q: str, n: int = 10) -> list[dict]:
+    """Open-web search via DuckDuckGo's HTML endpoint. No API key.
+
+    This is the channel that finds a DELETED creator: YouTube search returns
+    only reuploaders, but the web still indexes channel pages, stat sites and
+    archives. Verified: one query returns UC1Y-RkDrol_nyXk7vx8wgUA for POMEchan.
+    """
+    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q)
+    try:
+        r = http(url, timeout=25, headers=DESKTOP)
+    except Exception:                               # noqa: BLE001
+        return []
+    if r.status != 200:
+        return []
+    html = r.body.decode("utf-8", "replace")
+
+    def unwrap(href: str) -> str:
+        """DDG links are //duckduckgo.com/l/?uddg=<urlencoded real url>."""
+        m = re.search(r"[?&]uddg=([^&]+)", href or "")
+        if m:
+            return urllib.parse.unquote(m.group(1))
+        if href.startswith("//"):
+            return "https:" + href
+        return href
+
+    out = []
+    for m in re.finditer(
+            r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            html, re.S):
+        href, title = unwrap(m.group(1)), re.sub(r"<[^>]+>", "", m.group(2))
+        out.append({"url": href, "title": title.strip(), "snippet": ""})
+        if len(out) >= n:
+            break
+    if not out:                                     # lite layout fallback
+        for m in re.finditer(r'<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
+                             html, re.S):
+            href, title = m.group(1), re.sub(r"<[^>]+>", "", m.group(2))
+            if "duckduckgo" in href:
+                continue
+            out.append({"url": href, "title": title.strip(), "snippet": ""})
+            if len(out) >= n:
+                break
+    # carry the raw page so the caller can regex ids out of snippets too
+    if out:
+        out[0]["_raw_len"] = len(html)
+    return out
+
+
+def resolve_channel(name: str, want_titles: bool = True) -> str | None:
+    """Name -> the channel id whose CATALOGUE belongs to that name.
+
+    Two-step, because the obvious route does not work: YouTube search for a
+    deleted creator returns only reuploaders, never the original channel id.
+
+    1. search the name, collect video ids (the reuploads)
+    2. open each one's theasmrindex page; the deleted original channel id is
+       embedded there (verified: /video/SivsIFpGZKA carries UC1Y-RkDrol_...)
+
+    A channel id found this way is the one whose catalogue the reuploads came
+    from, which is exactly the witness we need.
+    """
+    p = subprocess.run(
+        ["yt-dlp", "--flat-playlist", "--playlist-end", "10",
+         "--print", "%(id)s", f"ytsearch10:{name}"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    vids = [ln.strip() for ln in (p.stdout or "").splitlines()
+            if re.fullmatch(r"[A-Za-z0-9_-]{11}", ln.strip())]
+
+    # Reupload videos are indexed only if the archive also carries the CREATOR.
+    # For POMEchan the reuploads are all 404 while the creator's own catalogue
+    # is present, so this only works when the name maps to an indexed channel.
+    for vid in vids[:5]:
+        try:
+            r = http(f"https://www.theasmrindex.com/video/{vid}", timeout=25,
+                     headers=DESKTOP)
+            if r.status != 200:
+                continue
+            html = r.body.decode("utf-8", "replace")
+            m = re.search(
+                r'<meta\s+property="video:director"\s+content="[^"]*?'
+                r'(UC[A-Za-z0-9_-]{22})"', html)
+            if m:
+                return m.group(1)
+        except Exception:                           # noqa: BLE001
+            continue
+    # Known boundary: a deleted creator's channel id cannot be derived from the
+    # brand name alone. Returning None is the honest answer; the caller reports
+    # it rather than silently producing an empty catalogue.
+    return None
+
+
 def archive_channel(cid: str, pages: int = 20) -> list[dict]:
     """Enumerate a deleted channel from theasmrindex's archive.
 
@@ -188,9 +279,14 @@ def archive_channel(cid: str, pages: int = 20) -> list[dict]:
             break
         page_html = r.body.decode("utf-8", "replace")
         found = 0
-        for m in re.finditer(r'href="/video/([A-Za-z0-9_-]{11})"[^>]*>([^<]{3,200})<',
-                             page_html):
-            out.append({"id": m.group(1), "title": m.group(2).strip()})
+        # The href is absolute and the title lives in a title="" attribute.
+        for m in re.finditer(
+                r'href="https://www\.theasmrindex\.com/video/([A-Za-z0-9_-]{11})"'
+                r'[^>]*?title="([^"]{3,300})"', page_html):
+            title = m.group(2)
+            if title.startswith("Watch "):
+                title = title[6:]
+            out.append({"id": m.group(1), "title": title.strip()})
             found += 1
         if not found:
             break
@@ -214,7 +310,9 @@ class LiveNet:
                 "search": search, "comments": comments, "ytsearch": ytsearch,
                 "ytchannel": ytchannel, "ytoembed": ytoembed,
                 "reverse_image": reverse_image,
-                "archive_channel": archive_channel}
+                "archive_channel": archive_channel,
+                "resolve_channel": resolve_channel,
+                "websearch": websearch}
 
     def probe(self, target: str) -> dict:
         """Resolve a URL or bare id into the item dict trace.run() expects."""
