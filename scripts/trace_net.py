@@ -348,10 +348,31 @@ def verify_channel(cid: str, name: str) -> bool:
     # `if titles:` silently skipped the check, which attackers used.
     if not titles:
         return False
-    asmrish = sum(1 for t in titles
-                  if re.search(r"asmr|睡眠導入|sleep|trigger|scratch|"
-                               r"tapping|massage|オイル|足裏|太もも",
-                               t, re.I))
+    # Same predicate as trace._genre_hit. A standalone loose regex here let
+    # "sleep trigger tutorial" pages pass when the catalogue was rejected.
+    CJK = ("助眠", "触发音", "触发", "丝袜", "耳朵", "掏耳", "采耳", "按摩",
+           "精油", "大腿", "摩擦", "耳语", "睡眠", "睡眠導入", "オイル",
+           "スクランチ")
+    LATIN = {"asmr", "sleep", "sleeping", "relax", "relaxation", "tingle",
+             "tingles", "massage", "trigger", "triggers", "whisper",
+             "whispers", "scratch", "scratching", "tapping", "oil", "oiled",
+             "thigh", "thighs", "foot", "feet"}
+    NONGENRE = {"tutorial", "lesson", "lecture", "programming", "python",
+                "sql", "postgresql", "database", "guide", "review", "docs",
+                "documentation", "course", "chapter", "manual", "维修", "教程",
+                "讲解", "评测", "开箱"}
+    word = re.compile(r"[a-z]+")
+
+    def hit(t):
+        low = (t or "").lower()
+        if any(g in low for g in CJK) or "asmr" in word.findall(low):
+            return True
+        w = set(word.findall(low))
+        if w & NONGENRE:
+            return False
+        return bool(w & LATIN)
+
+    asmrish = sum(1 for t in titles if hit(t))
     if asmrish < max(1, len(titles) // 3):
         return False
     return True

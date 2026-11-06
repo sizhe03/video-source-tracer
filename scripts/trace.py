@@ -1340,12 +1340,12 @@ def _genre_hit(title: str) -> bool:
     hits = words & _GENRE_LATIN
     if not hits:
         return False
-    # A lone ambiguous token (trigger / scratch / sleep) in a tutorial is not
-    # genre evidence. Require either two distinct genre tokens or no
-    # instructional context at all.
-    if len(hits) >= 2:
-        return True
-    return not (words & _NONGENRE)
+    # Instructional context wins over ANY number of ambiguous genre tokens.
+    # "PostgreSQL database sleep trigger tutorial" has two hits (sleep,
+    # trigger) and used to pass via `len(hits)>=2` before this guard.
+    if words & _NONGENRE:
+        return False
+    return len(hits) >= 1
 
 
 def _genre_overlap(titles: list[str]) -> int:
@@ -1368,31 +1368,39 @@ def _witness(cands: list[dict], name: str | None) -> dict | None:
         return None
     nl = name.lower()
 
-    # 1. A candidate whose AUTHOR carries the name, with genre agreement.
-    by_author: dict[str, list[dict]] = {}
+    # 1. A candidate whose AUTHOR carries the name, grouped BY CHANNEL ID.
+    # Grouping by author string alone let two different channels (11+11)
+    # pool into a 22-title witness and inflate the lead. Identity is the
+    # channel id, not the display name.
+    by_cid_author: dict[str, list[dict]] = {}
     for c in cands:
         who = (c.get("author") or "")
         wl = who.lower()
         if not (wl and (nl in wl or wl in nl)):
             continue
-        # An archived row's author is just the query name echoed back by the
-        # runner. And any row WITHOUT channel_verified (yt.channel, yt.search,
-        # related, space ...) is unverified too -- defaulting it to True let a
-        # plain 25-title channel become confirmed. Require the field explicitly.
         if c.get("channel_verified") is not True:
             continue
-        by_author.setdefault(who, []).append(c)
-    for who, rows in by_author.items():
+        cid = c.get("channel_id") or "unverified"
+        if cid == "unverified":
+            continue
+        by_cid_author.setdefault(cid, []).append(c)
+    best_rows: list[dict] | None = None
+    best_who = ""
+    for cid, rows in by_cid_author.items():
         titles = [r.get("title") or "" for r in rows]
         if _genre_overlap(titles) < max(1, len(titles) // 3):
             continue                       # namesake: same name, other subject
-        best = rows[0]
+        if best_rows is None or len(rows) > len(best_rows):
+            best_rows, best_who = rows, (rows[0].get("author") or "")
+    if best_rows:
+        titles = [r.get("title") or "" for r in best_rows]
+        best = best_rows[0]
         return {"witness_work_id": best["id"], "title": best.get("title"),
-                "author": who, "catalogue_size": len(rows),
+                "author": best_who, "catalogue_size": len(best_rows),
+                "channel_id": best.get("channel_id"),
                 "genre_matches": _genre_overlap(titles),
-                "channel_verified": all(r.get("channel_verified") is True
-                                        for r in rows),
-                "basis": "author_match"}
+                "channel_verified": True,
+                "basis": "archived_catalogue"}
 
     # 2. An ARCHIVED catalogue: the channel itself is gone, but a third party
     #    kept its titles. Measured on POMEchan: theasmrindex serves all 239.

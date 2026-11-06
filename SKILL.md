@@ -29,10 +29,14 @@ It returns three things:
 | `creator_conclusion` | who is credited as the author, plus ids | that the credit is true |
 | `diagnosis` | where the chain stopped | — |
 
-`creator_conclusion.level` is one of `confirmed` / `strong_lead` / `weak_lead`
-/ `guess` / `unconfirmed`. Only `confirmed` means a body of work was found
-under that creator's name; `guess` means the only name came from a hedged
-comment. `pending_queries` lists web searches still worth running.
+`creator_conclusion.level` is one of `strong_lead` / `weak_lead` / `guess` /
+`unconfirmed`. The engine NEVER outputs `confirmed`: string evidence (titles,
+archive pages, name matching) cannot prove authorship, so attribution is
+always delivered as a lead for a human to confirm. `strong_lead` means a
+verified channel catalogue or several independent uploaders agree; `guess`
+means the only name came from a hedged comment. `ids` holds channel/handle
+identifiers that were positively verified; `pending_queries` lists web
+searches still worth running.
 
 `discover.py` remains available for a narrower job -- same-platform copies,
 comments, cross-platform search and cover hashing only. It does not do

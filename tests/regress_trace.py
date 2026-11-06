@@ -588,6 +588,34 @@ check("a rejected fan cid never becomes a confirmed creator id",
       and _c17["level"] != "confirmed", str(_c17["ids"]))
 
 print()
+print("-- 18. final convergence: one genre rule, one cid ----------------")
+check("two genre tokens in a tutorial do not bypass the guard",
+      T._genre_hit("PostgreSQL database sleep trigger tutorial") is False,
+      "sleep+trigger used to short-circuit before the tutorial guard")
+check("Scratch programming tutorial is not genre",
+      T._genre_hit("Scratch programming tutorial") is False)
+check("real ASMR titles still pass", T._genre_hit("ASMR 丝袜 助眠") is True)
+
+# two different cids must not pool into one witness
+_r18 = []
+for _cid, _pre in (("UCAAAAAAAAAAAAAAAAAAAAAA", "A"),
+                   ("UCBBBBBBBBBBBBBBBBBBBBBB", "B")):
+    for i in range(11):
+        _r18.append({"platform": "youtube", "id": f"{_pre}{i}",
+                     "title": "【4KASMR】睡眠導入 太もも %d" % i,
+                     "author": "pomechan", "archive_of": "pomechan",
+                     "channel_id": _cid, "channel_verified": True})
+_c18 = T.creator_conclusion(_brands, _r18, [], [])
+check("two cids never pool into one 22-title witness",
+      (_c18.get("witness") or {}).get("catalogue_size", 0) <= 11,
+      str((_c18.get("witness") or {}).get("catalogue_size")))
+check("two cids yield no creator id",
+      not _c18["ids"]["youtube_channel"], str(_c18["ids"]))
+check("the engine still never claims confirmed",
+      all(x["level"] != "confirmed" for x in _c18["candidates"])
+      and _c18["level"] != "confirmed")
+
+print()
 bad = [n for n, c in R if not c]
 print(f"{len(R) - len(bad)}/{len(R)} checks passed")
 sys.exit(1 if bad else 0)
