@@ -461,7 +461,9 @@ class LiveNet:
         """Resolve a URL or bare id into the item dict trace.run() expects."""
         m = re.search(r"(BV[0-9A-Za-z]{10})", target)
         if not m:
-            raise SystemExit(f"cannot find a bilibili id in {target!r}")
+            raise SystemExit(
+                f"无法从 {target!r} 中识别出 BV 号。"
+                f"请提供 BV 号（如 BV1rCxf6MERM）或包含 BV 号的完整 B 站链接。")
         bvid = m.group(1)
         j = view(bvid)
         if j.get("code") != 0:

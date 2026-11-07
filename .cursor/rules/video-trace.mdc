@@ -1,0 +1,28 @@
+---
+description: 视频溯源工具 — 从 B 站视频链接找出原视频、原作者线索和作者频道 ID
+globs: ["scripts/**", "tests/**"]
+alwaysApply: false
+---
+
+# 视频溯源
+
+本仓库是 Python 工具，用于从 B 站视频链接找出原视频、原作者线索和作者频道 ID。完整指引见 [AGENTS.md](../../AGENTS.md)。
+
+## 用法
+
+```bash
+python scripts/trace.py BV1rCxf6MERM
+python scripts/trace.py BV1rCxf6MERM --json
+```
+
+## 修改代码时的约束
+
+改动 `scripts/` 前必须理解以下三条，否则会破坏已通过对抗评审的行为：
+
+1. **永不输出 `confirmed`。** `creator_conclusion.level` 最高是 `strong_lead`。历史上每加一条「让它更准」的规则，都会开出一条新的误判路径；正确做法是把结果标为线索让人确认。
+
+2. **`earliest_known` 与 `creator_conclusion` 绝不合并。** 前者答「哪条视频最早」，后者答「谁被署名」。合并会导致把搬运号报成原作者。
+
+3. **题材判据里语境守卫必须前置。** `_genre_hit()` 与 `trace_net.verify_channel()` 两处都要先查教程/讲座/医学语境词，再查题材词。顺序反了会让 `PostgreSQL database sleep trigger tutorial` 被当成 ASMR。
+
+改完必须跑 `python tests/run_all.py`，11 套件 / 367 项断言全绿。

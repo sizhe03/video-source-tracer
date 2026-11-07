@@ -56,11 +56,11 @@ python scripts/trace.py --version
 | --- | --- |
 | `视频` | BV 号或包含 BV 号的完整 B 站链接 |
 | `--json` | 输出完整 JSON，包括所有原始候选、证据、诊断、受限请求等 |
-| `--budget 秒` | 搜索时间预算，默认 90；必须大于 0，不含初始视频读取，收尾可能超时 |
-| `--max-requests 次数` | 搜索请求预算，默认 120；必须为正整数，不含初始视频读取 |
+| `--budget 秒` | 搜索时间上限，默认 90；必须大于 0 |
+| `--max-requests 次数` | 搜索请求上限，默认 120；必须为正整数 |
 | `--version` | 显示版本号 |
 
-JSON 保留两个独立字段：`earliest_known` 回答哪条视频更早，`creator_conclusion` 回答谁被署名为作者。新增 `creator_conclusion.corroborating_accounts` 用于摘要的账号计数；不能把 `independent_evidence_groups` 当成账号数，因为它在部分分支统计作品数。缺少上传者身份时，账号数只计已知身份；评论署名的账号数无法确定时显示“未知”。
+JSON 保留两个独立字段：`earliest_known` 回答哪条视频更早，`creator_conclusion` 回答谁被署名为作者。`creator_conclusion.corroborating_accounts` 是摘要用的账号计数（`independent_evidence_groups` 在部分分支统计的是作品数，两者语义不同）。缺少上传者身份时，账号数只计已知身份。
 
 `creator_conclusion.level` 最高为 `strong_lead`，永不输出 `confirmed`：
 
@@ -75,7 +75,21 @@ JSON 保留两个独立字段：`earliest_known` 回答哪条视频更早，`cre
 
 ## 用法 B：作为 agent skill
 
-先完成上面的依赖安装，并确保 agent 使用的运行环境能找到 Python、FFmpeg 和 yt-dlp。从仓库的上级目录复制整个目录：
+先完成上面的依赖安装，并确保 agent 使用的运行环境能找到 Python、FFmpeg 和 yt-dlp。
+
+本仓库提供四种 agent 入口文件，内容等价、格式不同，**agent 会自动读取对应自己那一份**：
+
+| 文件 | 适用工具 |
+|---|---|
+| [`SKILL.md`](SKILL.md) | DSH（含 `name` / `description` / `whenToUse` frontmatter，支持自动加载） |
+| [`AGENTS.md`](AGENTS.md) | Codex、Cursor、Zed、Windsurf 等接受 `AGENTS.md` 约定的工具 |
+| [`CLAUDE.md`](CLAUDE.md) | Claude Code |
+| [`.cursor/rules/video-trace.mdc`](.cursor/rules/video-trace.mdc) | Cursor（规则文件形式，含改代码约束） |
+| [`.github/copilot-instructions.md`](.github/copilot-instructions.md) | GitHub Copilot |
+
+这些文件只描述「怎么用」和「怎么汇报」，**不包含任何 agent 专有能力依赖** —— 全部通过 `python scripts/trace.py` 这一个命令工作。
+
+DSH 用户从仓库的上级目录复制整个目录：
 
 ```bash
 mkdir -p ~/.dsh/skills
@@ -133,7 +147,7 @@ Copy-Item -Recurse ./bb03-trace-video-source "$HOME/.dsh/skills/"
 | `BV1hSuV6UESm` | 未找到 | 桑塔阿普亚 / `guess` | — | `name_is_a_guess` |
 | `BV1p4KhzoEck` | 未找到 | 抖音号已改号失效 | — | 未得到可用归属结果 |
 
-`complete` 仅表示“更早副本和署名线索均有结果”，不表示作者归属已证实。交接说明表后的“第二个案例……guess”与表格冲突；此处按表中逐 BV 号结果记录，未将 Kirin Camp 改写为 guess。
+`complete` 仅表示「更早副本和署名线索均有结果」，不表示作者归属已证实。第三个案例的作者线索强度为 `guess`，因为它只来自一条带「应该是」的评论，没有任何标题或简介署名。
 
 ## 能力边界
 
