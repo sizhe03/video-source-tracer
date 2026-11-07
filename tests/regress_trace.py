@@ -726,6 +726,45 @@ check("a tripped kind is not spawned again",
       _pool21.spawn(_t21) is False)
 
 print()
+print("-- 22. independent corroboration, not row counting -------------")
+_b22, _p22 = T.Budget(10, 60), T.HostPacer({})
+_l22 = T.Ledger()
+_pool22 = T.Pool(_b22, _p22)
+_ctx22 = T.Ctx({}, _pool22, _b22, _p22, _l22, net={})
+# One work crediting two different names: the forged name must not borrow
+# the corroboration of the real one.
+_ctx22.note_credit("Evil", "BV1xpHq6BEDR", uploader="up1")
+_ctx22.note_credit("Kirin Camp", "BV1xpHq6BEDR", uploader="up1")
+_ctx22.note_credit("Kirin Camp", "BV1SECOND000", uploader="up2")
+_ctx22.note_original("EVIL0000000", "BV1xpHq6BEDR")
+check("a fake link cannot borrow another name's corroboration",
+      "EVIL0000000" not in _ctx22.corroborated_originals(),
+      str(_ctx22.corroborated_originals()))
+
+_ctx23 = T.Ctx({}, T.Pool(T.Budget(10, 60), T.HostPacer({})),
+               T.Budget(10, 60), T.HostPacer({}), T.Ledger(), net={})
+_ctx23.note_credit("Evil", "bvFORGED0001", uploader="u")
+_ctx23.note_credit("Evil", "BVFORGED0001", uploader="u")
+check("the same bvid in different casing is one work",
+      len(_ctx23.explicit_credits) == 1, str(_ctx23.explicit_credits))
+
+_c_same = T.creator_conclusion([], [], [], [], [
+    {"name": "Evil", "work_id": "BV1", "uploader": "one"},
+    {"name": "Evil", "work_id": "BV2", "uploader": "one"}])
+check("two works by the same uploader are not independent",
+      _c_same["level"] == "weak_lead", str(_c_same["level"]))
+_c_diff = T.creator_conclusion([], [], [], [], [
+    {"name": "Kirin Camp", "work_id": "BV1", "uploader": "a"},
+    {"name": "Kirin Camp", "work_id": "BV2", "uploader": "b"}])
+check("two uploaders crediting the same name are a strong lead",
+      _c_diff["level"] == "strong_lead", str(_c_diff["level"]))
+
+_d22 = T.diagnosis({"work_id": "BVx"},
+                   {"name": "Evil", "level": "weak_lead"}, [], 10, 1)
+check("an uncorroborated credit is not complete",
+      _d22["stage"] != "complete", str(_d22))
+
+print()
 bad = [n for n, c in R if not c]
 print(f"{len(R) - len(bad)}/{len(R)} checks passed")
 sys.exit(1 if bad else 0)

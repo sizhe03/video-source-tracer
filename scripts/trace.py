@@ -27,6 +27,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -475,15 +476,18 @@ class Ctx:
         return [d["name"] for d in self.comment_name_details()]
 
     def note_credit(self, name: str, work_id: str | None,
-                    source: str = "title") -> None:
+                    source: str = "title", uploader: str | None = None) -> None:
         with self._blocked_lock:
-            # One entry PER WORK, not one per name: corroboration is measured
-            # by how many distinct works credit the same person.
-            if work_id and not any(
-                    c["name"] == name and c["work_id"] == work_id
+            # NFKC + case-fold: "bvX" and "BVX" are ONE work, not two
+            # independent corroborations.
+            wid = (unicodedata.normalize("NFKC", str(work_id)).upper()
+                   if work_id else None)
+            if wid and not any(
+                    c["name"] == name and c["work_id"] == wid
                     for c in self.explicit_credits):
                 self.explicit_credits.append(
-                    {"name": name, "work_id": work_id, "source": source})
+                    {"name": name, "work_id": wid, "source": source,
+                     "uploader": uploader or ""})
 
     def note_original(self, vid: str, work_id: str | None = None) -> None:
         with self._blocked_lock:
@@ -507,15 +511,29 @@ class Ctx:
             pairs = list(getattr(self, "_original_pairs", []))
             credits = list(self.explicit_credits)
         works_per_name: dict[str, set] = {}
+        uploaders_per_name: dict[str, set] = {}
+        names_of_work: dict[str, set] = {}
         for c in credits:
-            if c.get("work_id"):
-                works_per_name.setdefault(c["name"], set()).add(c["work_id"])
-        name_of_work = {c["work_id"]: c["name"] for c in credits
-                        if c.get("work_id")}
+            wid = c.get("work_id")
+            if not wid:
+                continue
+            works_per_name.setdefault(c["name"], set()).add(wid)
+            up = c.get("uploader") or ""
+            uploaders_per_name.setdefault(c["name"], set()).add(
+                up or f"work:{wid}")
+            names_of_work.setdefault(wid, set()).add(c["name"])
         out = []
         for vid, work in pairs:
-            name = name_of_work.get(work)
-            if name and len(works_per_name.get(name, ())) >= 2:
+            wid = unicodedata.normalize("NFKC", str(work)).upper()
+            names = names_of_work.get(wid, set())
+            if not names:
+                continue
+            # A work crediting several names is only as trustworthy as its
+            # LEAST corroborated name; otherwise a forged name can borrow a
+            # real name's corroboration from the same page.
+            if all(len(uploaders_per_name.get(n, ())) >= 2
+                   and len(works_per_name.get(n, ())) >= 2
+                   for n in names):
                 out.append(vid)
         return list(dict.fromkeys(out))
 
@@ -580,7 +598,8 @@ def run_view(task: Task, ctx: Ctx) -> TaskResult:
         names = list(dict.fromkeys(
             explicit_credits(title) + explicit_credits(desc)))
         for name in names:
-            ctx.note_credit(name, bvid, "repost_credit")
+            ctx.note_credit(name, bvid, "repost_credit",
+                            uploader=(d.get("owner") or {}).get("name") or str((d.get("owner") or {}).get("mid") or ""))
         # Only bind the original-work link when this view also carries an
         # explicit credit. A bare "https://youtu.be/EVIL0000000" in a forged
         # description must not become the answer on its own.
@@ -644,7 +663,8 @@ def run_space(task: Task, ctx: Ctx) -> TaskResult:
         if _same_subject({"title": title,
                           "duration": _secs(v.get("length"))}, ctx.item, []):
             for name in explicit_credits(title):
-                ctx.note_credit(name, v.get("bvid"), "space_title")
+                ctx.note_credit(name, v.get("bvid"), "space_title",
+                            uploader=str(task.params.get("mid") or ""))
     leads = []
     for b, n in brands.items():
         leads.append({"kind": "brand", "value": b, "count": n,
@@ -676,7 +696,8 @@ def run_timeline(task: Task, ctx: Ctx) -> TaskResult:
                  "duration": _secs(v.get("duration") or v.get("length"))},
                 ctx.item, []):
             for name in explicit_credits(title):
-                ctx.note_credit(name, v.get("bvid"), "timeline_title")
+                ctx.note_credit(name, v.get("bvid"), "timeline_title",
+                            uploader=str(task.params.get("mid") or ""))
     leads = [{"kind": "brand", "value": b, "count": n, "source": "timeline"}
              for b, n in brands.items()]
     return TaskResult(candidates=cands, leads=leads)
@@ -758,7 +779,8 @@ def run_search(task: Task, ctx: Ctx) -> TaskResult:
         # against a single forged line, not the pubdate comparison.
         if subj_ok:
             for name in explicit_credits(title):
-                ctx.note_credit(name, r.get("bvid"), "search_title")
+                ctx.note_credit(name, r.get("bvid"), "search_title",
+                            uploader=str(r.get("mid") or r.get("author") or ""))
             if (r.get("bvid") and r.get("bvid") != ctx.item.get("id")
                     and ctx.earlier_dispatched < ctx.max_earlier_view):
                 # Its description often carries "作者：X" plus the original
@@ -1559,11 +1581,16 @@ def diagnosis(earliest: dict, creator: dict, blocked: list[dict],
         return {"stage": "name_is_a_guess",
                 "detail": "the only name came from a hedged comment; treat as "
                           "a lead, not an answer"}
-    if (creator.get("name") and creator.get("level") in ("strong_lead", "weak_lead")
+    if (creator.get("name") and creator.get("level") == "strong_lead"
             and earliest.get("work_id")):
         return {"stage": "complete",
                 "detail": "earliest copy and a credited creator lead found "
                           "(attribution is a lead, not a proof)"}
+    if (creator.get("name") and creator.get("level") == "weak_lead"
+            and earliest.get("work_id")):
+        return {"stage": "unconfirmed_creator",
+                "detail": "an earlier copy and a single credited name were "
+                          "found, but the credit is not corroborated"}
     if creator.get("name") and earliest.get("work_id"):
         return {"stage": "unconfirmed_creator",
                 "detail": f"found an earlier upload and a {creator['level']} "
@@ -1818,13 +1845,18 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
     # it become a strong lead. Measured attack: one forged earlier copy with
     # "作者：Evil" + a fake youtu.be link produced Evil/strong_lead/complete.
     credit_works: dict[str, set] = {}
+    credit_uploaders: dict[str, set] = {}
     for c in (explicit_credits or []):
-        credit_works.setdefault(c["name"], set()).add(c.get("work_id") or "?")
+        wid = c.get("work_id") or "?"
+        credit_works.setdefault(c["name"], set()).add(wid)
+        up = c.get("uploader") or ""
+        credit_uploaders.setdefault(c["name"], set()).add(up or f"work:{wid}")
     for name, works in credit_works.items():
         n = len([w for w in works if w != "?"])
+        independent = len(credit_uploaders.get(name, ())) >= 2
         candidates.append({
             "name": name,
-            "level": "strong_lead" if n >= 2 else "weak_lead",
+            "level": "strong_lead" if (n >= 2 and independent) else "weak_lead",
             "source": "repost_credit",
             "work_id": sorted(w for w in works if w != "?")[0]
                        if any(w != "?" for w in works) else None,
