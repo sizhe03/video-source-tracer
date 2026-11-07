@@ -52,6 +52,7 @@ HOST_OF = {
     "bili.view": "api.bilibili.com",
     "bili.related": "api.bilibili.com",
     "bili.space": "api.bilibili.com",
+    "bili.timeline": "api.bilibili.com",
     "bili.search": "api.bilibili.com",
     "bili.comments": "api.bilibili.com",
     "yt.search": "www.youtube.com",
@@ -72,6 +73,7 @@ HOST_OF = {
 PRIORITY = {
     "bili.view": 100,
     "bili.space": 95,
+    "bili.timeline": 94,
     # Comments outrank related and search: the thread is the one channel that
     # does not depend on the uploader writing a credit, and on the reference
     # case it was the only place a name appeared. At priority 70 it was the
@@ -303,6 +305,11 @@ class Pool:
         self.pacer = pacer
         self.max_tasks = max_tasks
         self.workers = workers
+        # Consecutive refusals per (kind). After the threshold, skip queued
+        # tasks of that kind instead of hammering a blocked endpoint.
+        self.failures: dict[str, int] = {}
+        self.tripped: set[str] = set()
+        self.trip_after = 2
         self.cv = threading.Condition()
         self.ready: list[Task] = []
         self.tasks: dict[str, Task] = {}
@@ -319,6 +326,8 @@ class Pool:
     def spawn(self, task: Task) -> bool:
         """Append a task. Called from inside a runner; wakes one worker."""
         with self.cv:
+            if task.kind in self.tripped:
+                return False
             if task.dedup_key in self.seen:
                 return False
             if len(self.tasks) >= self.max_tasks:
@@ -371,6 +380,13 @@ class Pool:
         return all(t.state in ("DONE", "FAILED", "BLOCKED", "SKIPPED", "ABORTED")
                    for t in self.tasks.values())
 
+    def note_refusal(self, kind: str) -> None:
+        """Count a refused request and trip the breaker when it repeats."""
+        with self.cv:
+            self.failures[kind] = self.failures.get(kind, 0) + 1
+            if self.failures[kind] >= self.trip_after:
+                self.tripped.add(kind)
+
     def finish(self, task: Task) -> None:
         with self.cv:
             self.done += 1
@@ -378,6 +394,17 @@ class Pool:
                 self.failed += 1
             elif task.state == "BLOCKED":
                 self.blocked += 1
+            # A successful call with actual output clears the streak. A
+            # DONE task that produced nothing (e.g. an empty search) does not
+            # prove the endpoint recovered.
+            if task.state == "DONE" and task.result and (
+                    task.result.candidates or task.result.evidence):
+                self.failures.pop(task.kind, None)
+                self.tripped.discard(task.kind)
+            # Drop already-queued tasks of a tripped kind.
+            if self.tripped:
+                self.ready = [t for t in self.ready
+                              if t.kind not in self.tripped]
             self.cv.notify_all()
 
     def stop(self, reason: str) -> None:
@@ -401,6 +428,15 @@ class Ctx:
         # backend. Dropping them is how the web channel contributed nothing.
         self.pending_queries: list[dict] = []
         self.identities: list[dict] = []
+        # Explicit "作者：X" credits and original-work links found in candidate
+        # titles / descriptions. These are the strongest attribution evidence
+        # available and were previously discarded.
+        self.explicit_credits: list[dict] = []
+        self.original_links: list[str] = []
+        # A broad title search can yield dozens of generic latin tokens. Each
+        # brand expansion spawns 5 tasks, so cap the total per run.
+        self.brand_expansions: int = 0
+        self.max_brand_expansions: int = 6
         self.item = item
         self.pool = pool
         self.budget = budget
@@ -421,6 +457,18 @@ class Ctx:
     def comment_names(self) -> list[str]:
         """Names a human wrote in the thread. Kept apart from title brands."""
         return [d["name"] for d in self.comment_name_details()]
+
+    def note_credit(self, name: str, work_id: str | None,
+                    source: str = "title") -> None:
+        with self._blocked_lock:
+            if not any(c["name"] == name for c in self.explicit_credits):
+                self.explicit_credits.append(
+                    {"name": name, "work_id": work_id, "source": source})
+
+    def note_original(self, vid: str) -> None:
+        with self._blocked_lock:
+            if vid not in self.original_links:
+                self.original_links.append(vid)
 
     def note_identity(self, value: str, source: str = "") -> None:
         with self._blocked_lock:
@@ -466,13 +514,28 @@ def run_view(task: Task, ctx: Ctx) -> TaskResult:
         ctx.note_blocked("view", f"code {j.get('code')}")
         return TaskResult(note=f"view code {j.get('code')}")
     d = j.get("data") or {}
+    bvid = d.get("bvid")
+    title = _strip_tags(d.get("title") or "")
+    desc = d.get("desc") or ""
+    # An earlier copy's title/description frequently names the original
+    # creator and links the original work. Capture both, not just the title
+    # string used for chronological sorting. But ONLY for a work that is
+    # plausibly the same subject -- otherwise an unrelated view's "作者：X"
+    # pollutes the creator candidates.
+    if _same_subject({"title": title, "duration": d.get("duration") or 0},
+                     ctx.item, []):
+        for name in explicit_credits(title + " " + desc):
+            ctx.note_credit(name, bvid, "repost_credit")
+        for vid in original_links(desc):
+            ctx.note_original(vid)
     out = TaskResult(candidates=[{
-        "platform": "bilibili", "id": d.get("bvid"),
-        "title": _strip_tags(d.get("title") or ""),
+        "platform": "bilibili", "id": bvid,
+        "title": title,
         "author": (d.get("owner") or {}).get("name"),
         "mid": (d.get("owner") or {}).get("mid"),
         "pubdate": d.get("pubdate") or 0,
         "duration": d.get("duration") or 0,
+        "desc": desc,
     }])
     cover = d.get("pic")
     if cover:
@@ -495,8 +558,13 @@ def run_view(task: Task, ctx: Ctx) -> TaskResult:
 def run_space(task: Task, ctx: Ctx) -> TaskResult:
     j = ctx.net["space"](task.params["mid"], task.params.get("pn", 1))
     if j.get("code") != 0:
-        ctx.note_blocked("space", f"code {j.get('code')}")
-        return TaskResult(note=f"space code {j.get('code')}")
+        # Space is risk-controlled. Fall back to the timeline endpoint before
+        # giving up: it uses a different path and still answers.
+        ctx.pool.spawn(Task.make(
+            "bili.timeline", parent=task,
+            origin={"src": task.id, "kind": "space_fallback"},
+            mid=task.params.get("mid"), pn=task.params.get("pn", 1)))
+        raise RuntimeError(f"bili.space code {j.get('code')}")
     vlist = (((j.get("data") or {}).get("list") or {}).get("vlist") or [])
     cands, brands = [], {}
     for v in vlist:
@@ -514,10 +582,44 @@ def run_space(task: Task, ctx: Ctx) -> TaskResult:
         for b in brand_tokens(title):
             brands.setdefault(b, 0)
             brands[b] += 1
+        if _same_subject({"title": title,
+                          "duration": _secs(v.get("length"))}, ctx.item, []):
+            for name in explicit_credits(title):
+                ctx.note_credit(name, v.get("bvid"), "space_title")
     leads = []
     for b, n in brands.items():
         leads.append({"kind": "brand", "value": b, "count": n,
                       "source": "space"})
+    return TaskResult(candidates=cands, leads=leads)
+
+
+@runner("bili.timeline")
+def run_timeline(task: Task, ctx: Ctx) -> TaskResult:
+    """Uploader timeline via the endpoint that survives space -401."""
+    j = ctx.net["timeline"](task.params["mid"], task.params.get("pn", 1),
+                            task.params.get("keywords", ""))
+    if j.get("code") != 0:
+        raise RuntimeError(f"bili.timeline code {j.get('code')}")
+    rows = ((j.get("data") or {}).get("archives") or [])
+    cands, brands = [], {}
+    for v in rows:
+        title = _strip_tags(v.get("title") or "")
+        cands.append({
+            "platform": "bilibili", "id": v.get("bvid"), "title": title,
+            "author": v.get("author"), "mid": task.params.get("mid"),
+            "pubdate": v.get("pubdate") or v.get("created") or 0,
+            "duration": _secs(v.get("duration") or v.get("length")),
+        })
+        for b in brand_tokens(title):
+            brands[b] = brands.get(b, 0) + 1
+        if _same_subject(
+                {"title": title,
+                 "duration": _secs(v.get("duration") or v.get("length"))},
+                ctx.item, []):
+            for name in explicit_credits(title):
+                ctx.note_credit(name, v.get("bvid"), "timeline_title")
+    leads = [{"kind": "brand", "value": b, "count": n, "source": "timeline"}
+             for b, n in brands.items()]
     return TaskResult(candidates=cands, leads=leads)
 
 
@@ -552,17 +654,51 @@ def run_search(task: Task, ctx: Ctx) -> TaskResult:
     j = ctx.net["search"](task.params["kw"], task.params.get("page", 1),
                           task.params.get("order", "pubdate"))
     if j.get("code") != 0:
-        ctx.note_blocked("search", f"code {j.get('code')}")
-        return TaskResult(note=f"search code {j.get('code')}")
+        raise RuntimeError(f"bili.search code {j.get('code')}")
     cands = []
     for r in ((j.get("data") or {}).get("result") or []):
+        title = _strip_tags(r.get("title") or "")
         cands.append({
             "platform": "bilibili", "id": r.get("bvid"),
-            "title": _strip_tags(r.get("title") or ""),
+            "title": title,
             "author": r.get("author"), "pubdate": r.get("pubdate") or 0,
             "duration": _secs(r.get("duration")),
             "cover": r.get("pic"),
+            "mid": r.get("mid"),
         })
+        # A repost ring shares the same source. If the input account's space
+        # is risk-controlled (-401), a discovered sibling's timeline often
+        # still carries the original creator's name. Dispatch immediately.
+        smid = r.get("mid")
+        if (smid and str(smid) != str(ctx.item.get("mid"))
+                and ctx.item.get("platform") == "bilibili"):
+            ctx.pool.spawn(Task.make(
+                "bili.space", parent=task,
+                origin={"src": task.id, "kind": "sibling_account",
+                        "via": r.get("author")},
+                mid=smid, pn=1))
+        pub = r.get("pubdate") or 0
+        inp = ctx.item.get("pubdate") or 0
+        # Only a candidate that is BOTH earlier AND plausibly the same work
+        # may contribute a credit or a description probe. Without this gate a
+        # date-sorted search spawned ~80 views and harvested "作者：X" from
+        # dozens of unrelated videos.
+        same_work = bool(
+            pub and inp and pub < inp
+            and _same_subject(
+                {"title": title, "duration": _secs(r.get("duration"))},
+                ctx.item, []))
+        if same_work:
+            for name in explicit_credits(title):
+                ctx.note_credit(name, r.get("bvid"), "search_title")
+            if r.get("bvid") and r.get("bvid") != ctx.item.get("id"):
+                # Its description often carries "作者：X" plus the original
+                # YouTube link, which search results omit. Instant dispatch.
+                ctx.pool.spawn(Task.make(
+                    "bili.view", parent=task,
+                    origin={"src": task.id, "kind": "earlier_copy",
+                            "via": "same_subject"},
+                    bvid=r.get("bvid")))
     return TaskResult(candidates=cands)
 
 
@@ -912,6 +1048,36 @@ def _looks_like_id(w: str) -> bool:
     return False
 
 
+# Explicit credit written by a reposter, e.g.
+#   "【4K】... | 作者：Kirin Camp | 机翻中文"
+# This is a direct human statement about the source and is much stronger than
+# a Latin token that happens to repeat.
+_CREDIT_RE = re.compile(
+    r"(?:原作者|作者|原创|from|by)\s*[:：]\s*"
+    # Stop at a field separator (| / ｜) or a common trailing descriptor,
+    # but ALLOW spaces inside a latin name ("Kirin Camp").
+    r"([\u4e00-\u9fff\u3040-\u30ffA-Za-z0-9_. -]{2,40}?)"
+    r"(?=\s*[|｜/、,，。]|\s*机翻|\s*搬运|\s*转载|\s*$)")
+_ORIGINAL_LINK_RE = re.compile(
+    r"https?://(?:www\.)?(?:youtu\.be/|youtube\.com/watch\?v=)"
+    r"([A-Za-z0-9_-]{11})")
+
+
+def explicit_credits(text: str) -> list[str]:
+    """Names a reposter explicitly credited in a title or description."""
+    out = []
+    for m in _CREDIT_RE.finditer(text or ""):
+        v = m.group(1).strip(" .-_|｜")
+        if v and v.lower() not in ("asmr", "机翻", "搬运"):
+            out.append(v)
+    return out
+
+
+def original_links(text: str) -> list[str]:
+    """YouTube ids linked as the original work in a description."""
+    return [m.group(1) for m in _ORIGINAL_LINK_RE.finditer(text or "")]
+
+
 def brand_tokens(title: str) -> list[str]:
     """Latin words in a Chinese title that could be a creator's brand.
 
@@ -960,7 +1126,7 @@ def brand_tokens(title: str) -> list[str]:
 # --------------------------------------------------------------------- run
 def run(item: dict, *, net: dict, budget_s: float = 90.0, max_requests: int = 120,
         routes: list[str] | None = None, gaps: dict[str, float] | None = None,
-        workers: int = 8, max_tasks: int = 400) -> dict:
+        workers: int = 8, max_tasks: int = 120) -> dict:
     """Launch every independent task at once, then follow the leads."""
     # A kind in HOST_OF with no runner is silently skipped at execution time.
     # That is how image.reverse and archive.channel -- the entire confirmation
@@ -995,6 +1161,11 @@ def run(item: dict, *, net: dict, budget_s: float = 90.0, max_requests: int = 12
                 seeds.append(Task.make("bili.search", kw=item["title"],
                                        page=1, order=order))
             seeds.append(Task.make("yt.search", q=item["title"], n=20))
+            # Independent of bilibili. When bili.space is risk-controlled this
+            # is the only remaining route to a name: the open web indexes
+            # deleted channels and repost credits that platform APIs hide.
+            seeds.append(Task.make("web.search",
+                                   q=item["title"], name=None))
     for s in seeds:
         pool.spawn(s)
 
@@ -1034,6 +1205,7 @@ def run(item: dict, *, net: dict, budget_s: float = 90.0, max_requests: int = 12
                 # was a 412, a timeout or a parse error, the channel is missing
                 # from the result -- so coverage is incomplete, not clean.
                 ctx.note_blocked(task.kind, str(e))
+                pool.note_refusal(task.kind)
             finally:
                 task.ended_at = time.monotonic()
                 pool.finish(task)
@@ -1052,13 +1224,15 @@ def run(item: dict, *, net: dict, budget_s: float = 90.0, max_requests: int = 12
     wall = round(time.monotonic() - t0, 1)
     snap = ledger.snapshot()
     brands = brand_consensus(snap["candidates"])
+    ek = earliest_known(snap["candidates"], item)
     return {
         "ok": True,
         "input": {k: item.get(k) for k in ("platform", "id", "title", "author", "mid")},
-        "earliest_known": earliest_known(snap["candidates"], item),
+        "earliest_known": dict(ek,
+                               original_links=list(ctx.original_links)),
         "creator_conclusion": creator_conclusion(
             brands, snap["candidates"], ctx.comment_name_details(),
-            ctx.identities),
+            ctx.identities, ctx.explicit_credits),
         "candidates": sorted(snap["candidates"], key=_rank_key),
         "brands": brands,
         "provenance": snap["edges"],
@@ -1068,9 +1242,10 @@ def run(item: dict, *, net: dict, budget_s: float = 90.0, max_requests: int = 12
         # difference between "found nothing" and "search this name".
         "pending_queries": ctx.pending_queries,
         "diagnosis": diagnosis(
-            earliest_known(snap["candidates"], item),
+            ek,
             creator_conclusion(brands, snap["candidates"],
-                               ctx.comment_name_details(), ctx.identities),
+                               ctx.comment_name_details(), ctx.identities,
+                               ctx.explicit_credits),
             ctx.blocked, len(snap["candidates"]), len(snap["edges"])),
         "stop_reason": pool.stop_reason or "frontier_empty",
         "wall_clock_s": wall,
@@ -1100,10 +1275,25 @@ def plan(lead: dict, task: Task, ctx: Ctx) -> list[Task]:
     if src == "comments":
         pass
     else:
-        n = sum(1 for c in ctx.ledger.snapshot()["candidates"]
-                if brand.lower() in (c.get("title") or "").lower())
-        if n < 2:
+        # Require the token under several DIFFERENT uploaders. Counting rows
+        # let generic words (world / travel / tajikistan) qualify from a single
+        # prolific account and fan out into ~100 tasks.
+        authors = set()
+        for c in ctx.ledger.snapshot()["candidates"]:
+            if brand.lower() not in (c.get("title") or "").lower():
+                continue
+            who = (c.get("author") or "").strip()
+            if not who and c.get("mid"):
+                who = f"mid:{c['mid']}"
+            if who:
+                authors.add(who)
+        # 2 distinct accounts is enough: a hard per-run cap below is what
+        # prevents fan-out, not an over-strict per-brand threshold.
+        if len(authors) < 2:
             return out
+    if ctx.brand_expansions >= ctx.max_brand_expansions:
+        return out
+    ctx.brand_expansions += 1
 
     origin = {"src": task.id, "kind": "brand", "via": brand, "from": src}
     out.append(Task.make("yt.search", parent=task, origin=origin,
@@ -1131,7 +1321,13 @@ def brand_consensus(cands: list[dict]) -> list[dict]:
     per: dict[str, set] = {}
     plats: dict[str, set] = {}
     for c in cands:
+        # Some bilibili endpoints (recArchivesByKeywords) omit the author but
+        # do carry mid. Without this fallback all such rows collapse into one
+        # empty-string bucket and a brand repeated across several accounts is
+        # counted as one account and discarded.
         who = (c.get("author") or "").strip()
+        if not who and c.get("mid"):
+            who = f"mid:{c['mid']}"
         plat = c.get("platform") or "?"
         for b in brand_tokens(c.get("title") or ""):
             per.setdefault(b.lower(), set()).add(who)
@@ -1507,7 +1703,8 @@ def known_ids(cands: list[dict], name: str | None,
 
 def creator_conclusion(brands: list[dict], cands: list[dict],
                        comment_names: list[str] | None = None,
-                       identities: list[dict] | None = None) -> dict:
+                       identities: list[dict] | None = None,
+                       explicit_credits: list[dict] | None = None) -> dict:
     """Who is credited as the author. Attribution only -- content is irrelevant.
 
     A name a person wrote in the thread outranks anything derived from titles.
@@ -1517,6 +1714,17 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
     """
     details = comment_names or []
     candidates = []
+
+    # A reposter writing "作者：Kirin Camp" in the title is an explicit credit,
+    # stronger than a derived brand token. Measured on BV1Xpxf6QEqk: the
+    # earlier copy's title and description both credited Kirin Camp, but the
+    # engine returned unconfirmed because only comments and repeated Latin
+    # tokens were consulted.
+    for c in (explicit_credits or []):
+        candidates.append({"name": c["name"], "level": "strong_lead",
+                           "source": "repost_credit",
+                           "work_id": c.get("work_id"), "hedged": False,
+                           "independent_evidence_groups": 1})
 
     # A confident statement in the thread outranks derived signals; a hedged
     # one does not. "桑塔阿普亚，应该是这个" is a guess and belongs below a brand
@@ -1567,7 +1775,7 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
     return {
         "name": top["name"], "level": level,
         "witness": wit,
-        "signature_work_id": None,
+        "signature_work_id": (top.get("work_id")),
         "witness_work_id": (wit or {}).get("witness_work_id"),
         "brand_sources": [top["source"]],
         "independent_evidence_groups": top["independent_evidence_groups"],

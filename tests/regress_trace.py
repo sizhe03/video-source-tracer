@@ -83,6 +83,14 @@ def _mk_pool():
     for i, t in enumerate(AMENG):
         rows.append({"bvid": f"BVA{i:08d}", "title": t, "author": "阿猛al",
                      "pubdate": 1793835738 - i * 86400, "length": "34:32"})
+    # A third independent uploader carrying the same brand. plan() requires
+    # >= 3 distinct authors before expanding a title-derived brand; the old
+    # two-account fixture could no longer trigger an expansion.
+    for i in range(4):
+        rows.append({"bvid": f"BVC{i:08d}",
+                     "title": "【POMEchan ASMR】大腿精油按摩 %d" % i,
+                     "author": "搬运三号",
+                     "pubdate": 1793835738 - i * 86400, "length": "34:00"})
     return rows
 
 
@@ -631,6 +639,78 @@ check("ids carry an explicit lead status",
       str(_c19["ids"].get("status")))
 check("ids no longer claim positive attribution",
       "POSITIVELY" not in str(_c19["ids"])),
+
+print()
+print("-- 20. explicit repost credit + original link (BV1Xpxf6QEqk) ----")
+_title20 = ("【4K】放松解压 带着全新粉色三居室帐篷拖车在雨中露营 | "
+            "作者：Kirin Camp | 机翻中文")
+check("an explicit 作者：X credit is extracted with its full name",
+      "Kirin Camp" in T.explicit_credits(_title20),
+      str(T.explicit_credits(_title20)))
+check("a CJK explicit credit is extracted",
+      "桑塔阿普亚" in T.explicit_credits("作者：桑塔阿普亚"))
+check("a youtu.be original link is extracted",
+      T.original_links("https://youtu.be/A0kPGKoqJRo") == ["A0kPGKoqJRo"])
+check("a youtube watch link is extracted",
+      T.original_links("https://www.youtube.com/watch?v=A0kPGKoqJRo")
+      == ["A0kPGKoqJRo"])
+
+# explicit credit outranks derived brands and yields a strong lead
+_c20 = T.creator_conclusion(
+    _brands,
+    [{"platform": "bilibili", "id": "BV1xpHq6BEDR", "title": _title20}],
+    [], [], [{"name": "Kirin Camp", "work_id": "BV1xpHq6BEDR",
+              "source": "repost_credit"}])
+check("explicit credit becomes the top creator",
+      _c20["name"] == "Kirin Camp" and _c20["level"] == "strong_lead",
+      str((_c20["name"], _c20["level"])))
+check("signature_work_id records where the credit was written",
+      _c20["signature_work_id"] == "BV1xpHq6BEDR",
+      str(_c20["signature_work_id"]))
+
+# an unrelated older video must NOT contribute a credit
+check("unrelated older titles do not yield credits",
+      T._same_subject(
+          {"title": "完全无关的一个数据库教程", "duration": 300},
+          {"title": ITEM["title"], "duration": ITEM["duration"]}, []) is False)
+
+# fan-out cap exists
+_src20 = (HERE.parent / "scripts" / "trace.py").read_text(encoding="utf-8")
+check("brand expansion is capped per run",
+      "max_brand_expansions" in _src20,
+      "a 95-upload account otherwise produced 100+ tasks")
+check("a title brand needs at least 2 distinct uploaders",
+      "len(authors) < 2" in _src20,
+      "a hard per-run expansion cap is what prevents fan-out")
+
+print()
+print("-- 21. risk-control fallback + circuit breaker ------------------")
+_src21 = (HERE.parent / "scripts" / "trace.py").read_text(encoding="utf-8")
+_net21 = (HERE.parent / "scripts" / "trace_net.py").read_text(encoding="utf-8")
+check("a timeline fallback endpoint exists",
+      "def timeline(" in _net21 and "recArchivesByKeywords" in _net21)
+check("space failure dispatches the timeline fallback",
+      '"bili.timeline"' in _src21 and "space_fallback" in _src21)
+check("a per-kind circuit breaker exists",
+      "note_refusal" in _src21 and "trip_after" in _src21)
+check("a non-zero space code is a real failure, not a DONE note",
+      'raise RuntimeError(f"bili.space code' in _src21)
+check("brand expansion has a per-run hard cap",
+      "max_brand_expansions" in _src21)
+check("a t=0 web search exists as a bilibili-independent route",
+      _src21.count('Task.make("web.search"') >= 2,
+      "one seed + one per brand lead")
+
+# the breaker actually trips
+_b21, _p21 = T.Budget(10, 50), T.HostPacer({})
+_pool21 = T.Pool(_b21, _p21)
+_pool21.note_refusal("bili.space")
+_pool21.note_refusal("bili.space")
+check("two consecutive refusals trip the breaker",
+      "bili.space" in _pool21.tripped, str(_pool21.tripped))
+_t21 = T.Task.make("bili.space", mid=1, pn=1)
+check("a tripped kind is not spawned again",
+      _pool21.spawn(_t21) is False)
 
 print()
 bad = [n for n, c in R if not c]

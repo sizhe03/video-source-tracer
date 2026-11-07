@@ -80,6 +80,14 @@ def space(mid: int, pn: int = 1) -> dict:
                  mid=mid, ps=50, pn=pn, order="pubdate")
 
 
+def timeline(mid: int, pn: int = 1, keywords: str = "") -> dict:
+    """Fallback uploader timeline. space/arc/search returns -401 under risk
+    control; this endpoint still answers. Verified code=0 with real rows.
+    """
+    return _bili("/x/series/recArchivesByKeywords", MOBILE,
+                 mid=mid, ps=50, pn=pn, keywords=keywords)
+
+
 def search(kw: str, page: int = 1, order: str = "pubdate") -> dict:
     """Search, sorted by publication date by default.
 
@@ -446,7 +454,8 @@ class LiveNet:
                 # run_comments expects (thread, meta). comments() above is the
                 # raw reply/main endpoint and returns a dict, so bind the
                 # thread reader instead.
-                "fetch_comments": _thread_comments}
+                "fetch_comments": _thread_comments,
+                "timeline": timeline}
 
     def probe(self, target: str) -> dict:
         """Resolve a URL or bare id into the item dict trace.run() expects."""
