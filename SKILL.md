@@ -1,5 +1,5 @@
 ---
-name: bb03-trace-video-source
+name: video-source-tracer
 description: Trace a video's original creator and original upload across platforms from a URL, short link, clip, screenshot, title or incomplete credit. Use for 找原作者、找原视频、查出处、搬运来源、同视频转载 and reverse video search on Bilibili, YouTube, Douyin, Xiaohongshu, TikTok, Instagram, X and other platforms. Inspect repost descriptions and nested comments, expand partial names, and verify content and creator attribution separately.
 whenToUse: 用户给了一个视频链接、短链、BV号、截图、标题或不完整的署名，想知道原视频是谁拍的、最初发在哪里、这个搬运号是从哪搬的。触发词包括 找原作者、原作者是谁、找原视频、原出处、查出处、这个视频哪来的、搬的谁的、搬运来源、同视频转载、谁先发的、最早发布、油管原片、抖音原号、reverse video search、find original creator、original upload、who made this video、repost source。适用于 Bilibili、YouTube、抖音、快手、小红书、TikTok、Instagram、X 等平台的视频溯源。
 ---

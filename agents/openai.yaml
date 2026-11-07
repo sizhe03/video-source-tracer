@@ -1,5 +1,5 @@
 interface:
-  display_name: bb03 trace video source
+  display_name: video source tracer
   short_description: Trace a video's original creator and original upload across platforms
     from a URL, short link, clip, screenshot, title or incomplete credit. Use for
     找原作者、找原视频、查出处、搬运来源、同视频转载 and reverse video search on Bilibili, YouTube, Douyin,

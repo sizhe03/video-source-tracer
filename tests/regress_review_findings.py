@@ -11,7 +11,7 @@ import urllib.parse as up
 from pathlib import Path
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-SKILL = Path(r"C:\Users\10552\.dsh\skills\bb03-trace-video-source")
+SKILL = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL / "scripts"))
 import discover  # noqa: E402
 

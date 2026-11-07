@@ -1,4 +1,4 @@
-# bb03-trace-video-source
+# video-source-tracer
 
 给定 B 站视频链接或 BV 号，整理更早副本、原作者及频道 ID 的高可能性线索和证据。
 
@@ -10,7 +10,7 @@ Trace a Bilibili video to earlier copies and possible creator identities, with e
 
 ### 三步上手
 
-1. 下载或克隆本仓库，进入 `bb03-trace-video-source` 目录，准备 Python 3.10+ 和虚拟环境：
+1. 下载或克隆本仓库，进入 `video-source-tracer` 目录，准备 Python 3.10+ 和虚拟环境：
 
    ```bash
    python -m venv .venv
@@ -93,14 +93,14 @@ DSH 用户从仓库的上级目录复制整个目录：
 
 ```bash
 mkdir -p ~/.dsh/skills
-cp -r bb03-trace-video-source ~/.dsh/skills/
+cp -r video-source-tracer ~/.dsh/skills/
 ```
 
 Windows PowerShell 对应：
 
 ```powershell
 New-Item -ItemType Directory -Force "$HOME/.dsh/skills"
-Copy-Item -Recurse ./bb03-trace-video-source "$HOME/.dsh/skills/"
+Copy-Item -Recurse ./video-source-tracer "$HOME/.dsh/skills/"
 ```
 
 然后对支持该 skill 机制的 agent 说：“帮我看这个视频的原作者：BV1rCxf6MERM”。[SKILL.md](SKILL.md) 是给 agent 读取的说明，`scripts/` 是独立 Python 工具，两者可分开使用。需要结构化证据的调用方应使用 `--json`；默认输出已从 JSON 改为摘要。

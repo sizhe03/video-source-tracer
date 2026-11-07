@@ -1,4 +1,4 @@
-"""Shared helpers for bb03-trace-video-source scripts.
+"""Shared helpers for video-source-tracer scripts.
 
 Stdlib only (urllib) — this environment has no `requests` and no `PIL`.
 All scripts print one JSON object to stdout and human notes to stderr.
