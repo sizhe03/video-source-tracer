@@ -487,8 +487,37 @@ class Ctx:
 
     def note_original(self, vid: str, work_id: str | None = None) -> None:
         with self._blocked_lock:
-            if vid not in self.original_links and work_id:
-                self.original_links.append(vid)
+            if not work_id:
+                return
+            if not hasattr(self, "_original_pairs"):
+                self._original_pairs = []
+            pair = (vid, work_id)
+            if pair not in self._original_pairs:
+                self._original_pairs.append(pair)
+
+    def corroborated_originals(self) -> list[str]:
+        """A link is an answer only when its work's credit is corroborated.
+
+        The real chain: one earlier copy carries the youtu.be link and
+        "作者：Kirin Camp"; a second repost credits the same name without the
+        link. So require >=2 distinct works for that NAME, not for the link.
+        A single forged credit has one work and stays rejected.
+        """
+        with self._blocked_lock:
+            pairs = list(getattr(self, "_original_pairs", []))
+            credits = list(self.explicit_credits)
+        works_per_name: dict[str, set] = {}
+        for c in credits:
+            if c.get("work_id"):
+                works_per_name.setdefault(c["name"], set()).add(c["work_id"])
+        name_of_work = {c["work_id"]: c["name"] for c in credits
+                        if c.get("work_id")}
+        out = []
+        for vid, work in pairs:
+            name = name_of_work.get(work)
+            if name and len(works_per_name.get(name, ())) >= 2:
+                out.append(vid)
+        return list(dict.fromkeys(out))
 
     def note_identity(self, value: str, source: str = "") -> None:
         with self._blocked_lock:
@@ -545,10 +574,19 @@ def run_view(task: Task, ctx: Ctx) -> TaskResult:
             and _same_subject(
                 {"title": title, "duration": d.get("duration") or 0},
                 ctx.item, [])):
-        for name in explicit_credits(title + " " + desc):
+        # Extract SEPARATELY: concatenating title+desc breaks the
+        # end-of-name lookahead in _CREDIT_RE, so a credit at the end of the
+        # title ("... | 作者：Kirin Camp") was silently missed.
+        names = list(dict.fromkeys(
+            explicit_credits(title) + explicit_credits(desc)))
+        for name in names:
             ctx.note_credit(name, bvid, "repost_credit")
-        for vid in original_links(desc):
-            ctx.note_original(vid, bvid)
+        # Only bind the original-work link when this view also carries an
+        # explicit credit. A bare "https://youtu.be/EVIL0000000" in a forged
+        # description must not become the answer on its own.
+        if names:
+            for vid in original_links(desc):
+                ctx.note_original(vid, bvid)
     out = TaskResult(candidates=[{
         "platform": "bilibili", "id": bvid,
         "title": title,
@@ -690,6 +728,16 @@ def run_search(task: Task, ctx: Ctx) -> TaskResult:
             "cover": r.get("pic"),
             "mid": r.get("mid"),
         })
+        # Compute these FIRST. An earlier version read `same_work` above its
+        # assignment, which raised UnboundLocalError on the first non-empty
+        # search result and silently killed the whole discovery channel.
+        pub = r.get("pubdate") or 0
+        inp = ctx.item.get("pubdate") or 0
+        subj_ok = _same_subject(
+            {"title": title, "duration": _secs(r.get("duration"))},
+            ctx.item, [])
+        same_work = bool(pub and inp and pub < inp and subj_ok)
+
         # A repost ring shares the same source, but only a FEW siblings are
         # worth a whole timeline request. Gate on the same-subject + earlier
         # test and a hard per-run cap; otherwise a broad search with 95
@@ -704,16 +752,6 @@ def run_search(task: Task, ctx: Ctx) -> TaskResult:
                 origin={"src": task.id, "kind": "sibling_account",
                         "via": r.get("author")},
                 mid=smid, pn=1))
-        pub = r.get("pubdate") or 0
-        inp = ctx.item.get("pubdate") or 0
-        # Only a candidate that is BOTH earlier AND plausibly the same work
-        # may contribute a credit or a description probe. Without this gate a
-        # date-sorted search spawned ~80 views and harvested "作者：X" from
-        # dozens of unrelated videos.
-        subj_ok = _same_subject(
-            {"title": title, "duration": _secs(r.get("duration"))},
-            ctx.item, [])
-        same_work = bool(pub and inp and pub < inp and subj_ok)
         # Credits only need subject agreement, not an earlier date: two
         # reposts of the same work may both be later than the input yet both
         # name the original creator. Corroboration (>=2 works) is the guard
@@ -1270,7 +1308,7 @@ def run(item: dict, *, net: dict, budget_s: float = 90.0, max_requests: int = 12
         "ok": True,
         "input": {k: item.get(k) for k in ("platform", "id", "title", "author", "mid")},
         "earliest_known": dict(ek,
-                               original_links=list(ctx.original_links)),
+                               original_links=ctx.corroborated_originals()),
         "creator_conclusion": creator_conclusion(
             brands, snap["candidates"], ctx.comment_name_details(),
             ctx.identities, ctx.explicit_credits),
@@ -1388,11 +1426,12 @@ def brand_consensus(cands: list[dict]) -> list[dict]:
                      "platforms": sorted(plats.get(b, set())),
                      "proper_hits": proper.get(b, 0),
                      "sample": sorted(a)[:4]})
-    # Proper-name signal first: it separates a creator handle from a genre
-    # word that happens to be repeated by every reposter in the ring.
-    return sorted(rows, key=lambda d: (-d["proper_hits"],
-                                       -len(d["platforms"]),
-                                       -d["accounts"]))
+    # Cross-platform corroboration is the primary signal. `proper_hits` is
+    # only a TIE-BREAKER: putting it first let a capitalised common noun
+    # (Sunshine / World) outrank a real handle that appeared on two platforms.
+    return sorted(rows, key=lambda d: (-len(d["platforms"]),
+                                       -d["accounts"],
+                                       -d["proper_hits"]))
 
 
 def _rank_key(c: dict):
@@ -1837,7 +1876,12 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
     # and ids as the evidence a human can act on.
     if (wit and wit.get("catalogue_size", 0) >= 20
             and wit.get("channel_verified")
-            and level == "weak_lead"):
+            and level == "weak_lead"
+            # A single uncorroborated "作者：X" is deliberately weak_lead.
+            # An archive catalogue of ASMR titles is not independent evidence
+            # of THAT name, so it must not launder the credit into a strong
+            # lead. Only a title-brand weak_lead may be upgraded.
+            and top.get("source") == "titles"):
         level = "strong_lead"
     return {
         "name": top["name"], "level": level,
