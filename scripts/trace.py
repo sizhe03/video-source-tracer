@@ -2001,7 +2001,7 @@ def cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("target", metavar="视频", help="B 站视频 BV 号或包含 BV 号的完整链接")
     parser.add_argument("--json", action="store_true", help="输出完整 JSON，供程序处理或检查证据")
     parser.add_argument("--budget", type=float, default=90, metavar="秒",
-                        help="搜索时间上限，单位秒，默认 90")
+                        help="搜索阶段预算，默认 90 秒；不含初始读取，在途请求和收尾可使总耗时超出预算，并非严格超时")
     parser.add_argument("--max-requests", type=int, default=120, metavar="次数",
                         help="搜索请求预算，默认 120；不含初始视频读取")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}",

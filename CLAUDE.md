@@ -4,16 +4,20 @@
 
 完整工作指引见 [AGENTS.md](AGENTS.md)（环境准备、命令用法、输出含义、能力边界、汇报时必须保留的注意事项）。
 
+这是仓库级指引，不是 Skill 安装步骤；具体加载行为取决于 Claude Code 版本和设置，尚未在该宿主完成端到端验证。
+
 ## 快速开始
+
+先定位仓库根目录并从该目录运行命令：
 
 ```bash
 python -m pip install -r requirements.txt   # numpy + opencv-python-headless
 # 另需系统安装 ffmpeg 和 yt-dlp 到 PATH
 
-python scripts/trace.py BV1rCxf6MERM
+python scripts/trace.py BV1rCxf6MERM --json
 ```
 
-默认输出 7 行中文摘要；加 `--json` 输出完整证据 JSON。
+agent 读取证据时使用 `--json`；省略时是最多 10 行的文字摘要。搜索预算不含初始读取，在途请求和收尾可能增加总耗时，详见 AGENTS.md。
 
 ## 最重要的三条
 
@@ -26,5 +30,5 @@ python scripts/trace.py BV1rCxf6MERM
 ## 测试
 
 ```bash
-python tests/run_all.py    # 11 套件 / 367 项断言，全离线
+python tests/run_all.py    # 离线回归；以实际报告为准
 ```

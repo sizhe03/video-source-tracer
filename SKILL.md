@@ -1,7 +1,6 @@
 ---
 name: video-source-tracer
 description: Trace a video's original creator and original upload across platforms from a URL, short link, clip, screenshot, title or incomplete credit. Use for 找原作者、找原视频、查出处、搬运来源、同视频转载 and reverse video search on Bilibili, YouTube, Douyin, Xiaohongshu, TikTok, Instagram, X and other platforms. Inspect repost descriptions and nested comments, expand partial names, and verify content and creator attribution separately.
-whenToUse: 用户给了一个视频链接、短链、BV号、截图、标题或不完整的署名，想知道原视频是谁拍的、最初发在哪里、这个搬运号是从哪搬的。触发词包括 找原作者、原作者是谁、找原视频、原出处、查出处、这个视频哪来的、搬的谁的、搬运来源、同视频转载、谁先发的、最早发布、油管原片、抖音原号、reverse video search、find original creator、original upload、who made this video、repost source。适用于 Bilibili、YouTube、抖音、快手、小红书、TikTok、Instagram、X 等平台的视频溯源。
 ---
 
 # Trace video sources
@@ -11,18 +10,36 @@ Treat platform scripts as helpers; use the available platform connector or page
 reader when a script does not support that service. Respect a user-requested
 search method, such as image search instead of title search.
 
+## Execution environment and structured output
+
+Resolve this Skill's root directory first and run the following commands from
+that directory, not from an unrelated user project. Preserve the full resource
+folder when installing the Skill. Python 3.10+, installed dependencies and
+network access are required; supplementary browser/search routes depend on the
+host's available tools. A Skill document does not provide those capabilities.
+
+The main CLI accepts Bilibili BV IDs or URLs containing a BV ID. Resolve short
+links with `resolve.py` first. Other platform URLs, screenshots and titles need
+the investigation routes below; do not pass them directly to `trace.py`.
+
 ## Start every independent route at once
 
 ```bash
-python scripts/trace.py BV1p4KhzoEck
-python scripts/trace.py BV1p4KhzoEck --budget 120 --max-requests 200
+python scripts/trace.py BV1p4KhzoEck --json
+python scripts/trace.py BV1p4KhzoEck --json --budget 120 --max-requests 200
 ```
 
-`trace.py` is the entry point. Every independent request is launched at t=0 and
-a lead is dispatched the moment it appears -- there is no phase ordering.
-`--budget` is seconds; `--max-requests` counts HTTP calls for the whole run.
+`trace.py` is the entry point. Independent tasks are scheduled concurrently,
+subject to worker limits, per-host pacing and budget; new leads can enqueue
+successor tasks immediately without waiting for unrelated routes to finish.
+`--budget` is the search-stage budget in seconds, not a strict end-to-end timeout:
+initial video retrieval is outside it, and in-flight requests and shutdown can
+extend elapsed time. `--max-requests` counts budgeted search-stage requests,
+excluding initial video retrieval.
 
-It returns three things:
+Default CLI output is a human-readable summary. **Use `--json` when reading
+structured evidence**; do not parse the default summary as JSON. The JSON
+includes these three fields:
 
 | field | answers | never claims |
 |---|---|---|
@@ -43,6 +60,11 @@ worth running.
 `discover.py` remains available for a narrower job -- same-platform copies,
 comments, cross-platform search and cover hashing only. It does not do
 attribution and does not query the open web.
+
+### Legacy `discover.py` route contract
+
+The following four-route details describe `discover.py`, not the `trace.py`
+task scheduler above. Keep their output schemas and capabilities separate.
 
 Four routes are independent and run **concurrently**, not in a fixed order:
 
@@ -73,8 +95,9 @@ Three constraints the module enforces:
    reports how many merges happened.
 2. **Shared rate limits and a global budget.** The per-host gap is enforced
    across threads for API calls, so four routes do not mean four times the
-   request rate to one host. `--budget` (seconds) and `--max-requests` cap the
-   whole run. Cover images are the exception: they are fetched from
+   request rate to one host. `--budget` (seconds) and `--max-requests` limit
+   budgeted discovery work, not the initial metadata fetch or a strict total
+   wall-clock duration. Cover images are fetched from
    `i0.hdslb.com` and are charged to the budget but paced separately.
    `comments.py`'s own throttle is disabled for the duration of the run so the
    board's limiter is the only pacing authority.
@@ -91,8 +114,10 @@ open, not identities.
 ## Workflow
 
 1. Normalize the input and preserve its canonical URL and native ID.
-2. Run `trace.py`. It launches view / related / space / search (both `order=pubdate`
-   and `order=click`) / comments / ytsearch / cover reverse-search together.
+2. Run `trace.py <BV-or-URL> --json` from the Skill root. It schedules independent
+   discovery tasks concurrently; follow-up tasks depend on the evidence found.
+   Inspect `provenance`, failures and coverage rather than assuming every
+   possible route ran.
 3. Read `earliest_known`, `creator_conclusion` and `diagnosis`. If
    `pending_queries` is non-empty, run those web searches -- they are how a
    deleted creator's channel id is recovered.
@@ -307,8 +332,8 @@ YouTube paths. Check a script's usage before supplying options; cookie support
 varies by entry point. Run `python tests/run_all.py` for the offline regression set.
 
 - `resolve.py`, `probe.py`: normalize links and inspect metadata.
-- `trace.py`: the entry point. Task pool with instant dispatch; returns
-  `earliest_known` / `creator_conclusion` / `diagnosis`.
+- `trace.py`: the entry point. Task pool with instant dispatch; use `--json`
+  for `earliest_known` / `creator_conclusion` / `diagnosis` and full evidence.
 - `trace_net.py`: the network channels `trace.py` uses, injectable for tests.
 - `discover.py`: a narrower concurrent discovery pass (copies, comments, cross
   platform, cover hash). No attribution, no web search.

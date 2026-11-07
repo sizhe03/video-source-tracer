@@ -1,14 +1,14 @@
 # 视频溯源（video source tracing）
 
-给定 B 站视频链接、短链或 BV 号，找出原视频、原作者线索和作者频道 ID。
+主 CLI 接受 BV 号或包含 BV 号的 B 站链接，整理更早副本、原作者线索和作者频道 ID。短链先用 `scripts/resolve.py` 还原。
 
-本文件是给 AI agent 的工作指引，适用于任何支持 `AGENTS.md` 约定的工具（Codex、Cursor、Zed、Windsurf 等）。DSH 用户请直接使用 [SKILL.md](SKILL.md)（格式不同，内容等价）。
+本文件是支持 `AGENTS.md` 约定的宿主在本仓库内工作时的指引，不等于安装了可全局触发的 Skill。完整调查工作流见 [SKILL.md](SKILL.md)；该格式不局限于 DSH，安装位置及加载行为由宿主版本和配置决定。其他宿主尚未逐一端到端验证。
 
 ---
 
 ## 环境准备
 
-只需要三样东西，不需要任何 agent 专有能力：
+先定位本仓库或已安装 Skill 的根目录，以下相对路径命令均从该目录执行。基础路径需要 Python、读文件、执行命令和联网能力；完整工作流的补查还可能使用宿主提供的浏览、搜索工具。
 
 ```bash
 python -m pip install -r requirements.txt   # numpy + opencv-python-headless
@@ -27,16 +27,17 @@ python scripts/trace.py --version
 
 ## 怎么用
 
-**唯一入口：`python scripts/trace.py <BV号或链接>`**
+**结构化证据入口：`python scripts/trace.py <BV号或链接> --json`**
 
 ```bash
-python scripts/trace.py BV1rCxf6MERM
-python scripts/trace.py "https://www.bilibili.com/video/BV1rCxf6MERM"
-python scripts/trace.py BV1rCxf6MERM --json          # 完整证据 JSON
-python scripts/trace.py BV1rCxf6MERM --budget 60     # 时间预算（秒）
+python scripts/trace.py BV1rCxf6MERM --json
+python scripts/trace.py "https://www.bilibili.com/video/BV1rCxf6MERM" --json
+python scripts/trace.py BV1rCxf6MERM --json --budget 60
 ```
 
-默认输出 7 行中文摘要，例如：
+`--budget` 是搜索阶段预算，不含初始读取，在途请求和收尾可使总耗时超过该值。`--max-requests` 同样不计初始读取。
+
+省略 `--json` 时输出不超过 10 行的中文摘要（不要将其作为 JSON 解析）。以下为节选：
 
 ```text
 输入    : BV1rCxf6MERM  【ASMR】丝袜"脱了"放我耳朵上？_丝袜触发音
@@ -88,10 +89,10 @@ python scripts/trace.py BV1rCxf6MERM --budget 60     # 时间预算（秒）
 
 | 场景 | 结果 |
 |---|---|
-| 搬运号保留了上游署名（标题写「作者：XXX」、简介有 youtu.be 链接） | ✅ 能找到 |
-| 搬运号彻底洗稿（标题、简介、标签全抹掉署名） | ❌ 只能给 `guess` 或 `unconfirmed` |
-| 原作者账号已删除 | ⚠️ 可能通过第三方存档站点找回目录，但不保证 |
-| 非视频内容（图片、纯文字） | ❌ 不支持 |
+| 搬运号保留了上游署名（标题写「作者：XXX」、简介有 youtu.be 链接） | 较有利，仍取决于检索和访问情况 |
+| 标题、简介、标签抹掉署名 | 自动路径可能只返回猜测或空结果；按可用工具继续调查 |
+| 原作者账号已删除 | 可能通过第三方存档站点找回目录，但不保证 |
+| 截图、标题、非 B 站链接 | 主 CLI 不直接接受；见 SKILL.md 的补充调查流程 |
 
 ---
 
@@ -125,7 +126,7 @@ python scripts/channel.py "@candidate" --duration 631      # 频道目录核查
 ## 测试
 
 ```bash
-python tests/run_all.py    # 11 套件 / 367 项断言，全离线
+python tests/run_all.py    # 离线回归；以实际报告为准
 ```
 
-离线测试覆盖全部判定逻辑。真实网络请求不在回归测试内，发布前单独低频验证。
+离线测试覆盖已有回归案例，不代表全部判定逻辑均已覆盖。跨系统结果以 GitHub Actions 实际记录为准；真实网络及 agent 加载行为需要单独验证。

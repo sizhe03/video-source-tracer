@@ -2,13 +2,15 @@
 
 本仓库是 Python 工具，从 B 站视频链接找出原视频、原作者线索和作者频道 ID。
 
-完整指引见 [AGENTS.md](AGENTS.md)。
+完整指引见 [AGENTS.md](../AGENTS.md)。这是仓库级指引，并非 Skill 安装文件；加载行为由 Copilot 版本与设置决定，尚未端到端验证。
+
+先定位仓库根目录，从该目录执行相对路径命令。读取结构化证据时加 `--json`；默认输出是文字摘要。
 
 ## 用法
 
 ```bash
 python -m pip install -r requirements.txt
-python scripts/trace.py BV1rCxf6MERM
+python scripts/trace.py BV1rCxf6MERM --json
 ```
 
 ## 汇报时必须保留的边界

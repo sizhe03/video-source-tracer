@@ -62,7 +62,7 @@ print("=" * 84)
 suites = ["regress_auprint.py", "regress_find_earlier.py",
           "regress_v5_counterexamples.py", "regress_v6_counterexamples.py", "regress_v7_counterexamples.py",
           "entry_e2e.py", "reverify.py", "regress_discover.py", "regress_v8_fixes.py",
-          "regress_review_findings.py", "regress_trace.py"]
+          "regress_review_findings.py", "regress_trace.py", "regress_cli_smoke.py"]
 env = dict(os.environ, PYTHONIOENCODING="utf-8")
 results = []
 for s in suites:
@@ -76,6 +76,8 @@ for s in suites:
     if p.returncode != 0:
         for l in lines[-8:]:
             print(f"      {l}")
+        for l in (p.stderr or "").splitlines()[-20:]:
+            print(f"      stderr: {l}")
 
 print()
 print("=" * 84)

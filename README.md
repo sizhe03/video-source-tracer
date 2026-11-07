@@ -4,6 +4,19 @@
 
 Trace a Bilibili video to earlier copies and possible creator identities, with evidence for human review.
 
+## 发布状态与验证范围
+
+当前定位为**公开测试版**。CLI 的 `1.0.0` 是程序版本标识，不代表所有平台均已通过验证。
+
+| 范围 | 状态 |
+| --- | --- |
+| Windows 本机 | 已在原目录及临时复制目录的全新虚拟环境安装依赖并通过离线回归；此前验证过少量 B 站真实案例 |
+| Linux / macOS | 已配置 GitHub Actions 离线测试；以仓库实际运行记录为准，尚不宣称已通过 |
+| DSH | 本机已加载此 Skill 并调用脚本 |
+| 其他 agent | 提供 Skill 及仓库指引；尚未逐一安装、加载和端到端验证 |
+
+主 CLI 当前接受 **BV 号或包含 BV 号的 B 站链接**。短链先使用 `scripts/resolve.py` 还原；其他平台链接、截图、标题属于 Skill 的调查工作流，依赖 agent 可用的浏览、搜索和媒体工具，不是主 CLI 的通用输入。
+
 ## 用法 A：独立 Python 工具
 
 不依赖 DSH 或 agent。`scripts/` 可以独立运行，`_common.py` 是项目自带模块。
@@ -56,8 +69,8 @@ python scripts/trace.py --version
 | --- | --- |
 | `视频` | BV 号或包含 BV 号的完整 B 站链接 |
 | `--json` | 输出完整 JSON，包括所有原始候选、证据、诊断、受限请求等 |
-| `--budget 秒` | 搜索时间上限，默认 90；必须大于 0 |
-| `--max-requests 次数` | 搜索请求上限，默认 120；必须为正整数 |
+| `--budget 秒` | 搜索阶段预算，默认 90；必须大于 0。不含初始视频读取，在途请求和收尾可使总耗时超过该值，并非严格的程序超时 |
+| `--max-requests 次数` | 搜索阶段计数请求预算，默认 120；必须为正整数，不含初始视频读取 |
 | `--version` | 显示版本号 |
 
 JSON 保留两个独立字段：`earliest_known` 回答哪条视频更早，`creator_conclusion` 回答谁被署名为作者。`creator_conclusion.corroborating_accounts` 是摘要用的账号计数（`independent_evidence_groups` 在部分分支统计的是作品数，两者语义不同）。缺少上传者身份时，账号数只计已知身份。
@@ -77,17 +90,23 @@ JSON 保留两个独立字段：`earliest_known` 回答哪条视频更早，`cre
 
 先完成上面的依赖安装，并确保 agent 使用的运行环境能找到 Python、FFmpeg 和 yt-dlp。
 
-本仓库提供四种 agent 入口文件，内容等价、格式不同，**agent 会自动读取对应自己那一份**：
+### Skill 安装与仓库指引是两回事
 
-| 文件 | 适用工具 |
+`SKILL.md` 并非 DSH 专有格式。支持 Agent Skills 的宿主（例如具备相应功能的 Claude Code、Codex）也可以读取这种「YAML 元数据 + Markdown 正文」结构。请按所用产品及版本的安装说明，将**整个目录**安装到其技能目录；保留 `scripts/`、`references/` 等资源。不是只复制一个 Markdown 文件。
+
+`AGENTS.md`、`CLAUDE.md` 等则是**在本仓库中工作时的指引**，不等于在任意对话中安装了可自动触发的 Skill。是否加载、何时触发以及命令权限由宿主版本、设置和工作目录决定。
+
+| 文件 | 用途与验证状态 |
 |---|---|
-| [`SKILL.md`](SKILL.md) | DSH（含 `name` / `description` / `whenToUse` frontmatter，支持自动加载） |
-| [`AGENTS.md`](AGENTS.md) | Codex、Cursor、Zed、Windsurf 等接受 `AGENTS.md` 约定的工具 |
-| [`CLAUDE.md`](CLAUDE.md) | Claude Code |
-| [`.cursor/rules/video-trace.mdc`](.cursor/rules/video-trace.mdc) | Cursor（规则文件形式，含改代码约束） |
-| [`.github/copilot-instructions.md`](.github/copilot-instructions.md) | GitHub Copilot |
+| [`SKILL.md`](SKILL.md) | Skill 操作流程；本机 DSH 已加载，其他宿主待验证 |
+| [`AGENTS.md`](AGENTS.md) | 支持该约定的 agent 的仓库指引；各宿主加载情况待验证 |
+| [`CLAUDE.md`](CLAUDE.md) | Claude Code 仓库指引；待验证 |
+| [`.cursor/rules/video-trace.mdc`](.cursor/rules/video-trace.mdc) | Cursor 条件规则，当前并非始终加载；待验证 |
+| [`.github/copilot-instructions.md`](.github/copilot-instructions.md) | 支持仓库自定义指引的 Copilot 环境；待验证 |
 
-这些文件只描述「怎么用」和「怎么汇报」，**不包含任何 agent 专有能力依赖** —— 全部通过 `python scripts/trace.py` 这一个命令工作。
+核心 Python 脚本不导入 DSH 运行时。基础路径需要读文件、运行 Python 和网络访问能力；完整 Skill 的截图、跨平台补查等路径可能还需要宿主提供搜索、浏览或媒体工具。仅能聊天、没有执行环境的模型不会因为读取 Skill 就获得这些能力。
+
+所有示例命令均从本仓库（或已安装 Skill 的根目录）执行；agent 不应假设自己的当前目录就是技能目录。读取结构化证据时使用 `python scripts/trace.py <BV号> --json`，默认文字摘要不适合 JSON 解析。
 
 DSH 用户从仓库的上级目录复制整个目录：
 
@@ -156,8 +175,8 @@ Copy-Item -Recurse ./video-source-tracer "$HOME/.dsh/skills/"
 - 字符串证据（标题、页面、名字匹配）无法证明归属。归属证明留给人；频道 ID 同样只是字符串证据线索。
 - B 站搜索结果和风控会波动，同一链接不同时刻可能拿到不同副本。
 - 引擎如实报告 `coverage_incomplete` / `blocked_requests`，不编造答案。遇到 B 站 412 风控时应停止频繁重试；缺失结果不能证明原视频不存在。
-- 能工作的场景：搬运号保留了上游署名，例如标题写“作者：Kirin Camp”。
-- 不能工作的场景：搬运号彻底洗稿，标题、简介、标签全部抹掉署名。
+- 较有利的场景：搬运号保留了上游署名，例如标题写“作者：Kirin Camp”；仍取决于检索结果和访问情况，不保证成功。
+- 较困难的场景：标题、简介、标签均抹掉署名；自动路径可能只有猜测或空结果，agent 可根据可用工具进一步调查。
 
 ## 验证与许可证
 
@@ -165,6 +184,10 @@ Copy-Item -Recurse ./video-source-tracer "$HOME/.dsh/skills/"
 python tests/run_all.py
 ```
 
-测试入口执行模块编译、UTF-8 编码扫描和 11 个离线回归套件，包含 CLI 摘要、JSON 完整性及参数处理测试。真实网络请求不属于离线回归测试，发布前应单独低频验证。
+测试入口执行模块编译、UTF-8 编码扫描和离线回归套件，包含 CLI 摘要、JSON 完整性及参数处理测试。通过测试表示已有用例通过，不等于全部逻辑覆盖或真实平台始终可用。
+
+[GitHub Actions](.github/workflows/ci.yml) 配置了 Windows、Ubuntu、macOS 与 Python 3.10、3.12 的矩阵。每个任务在独立 runner 安装依赖，检查 CLI 帮助、版本、错误退出码，并运行离线测试；不请求 B 站或 YouTube。工作流上传后还需查看 Actions 实际结果，配置文件本身不是通过证明。该矩阵也不验证各 agent 的 Skill 加载、真实媒体下载或系统 FFmpeg 集成。
+
+真实网络请求不属于离线回归测试，发布前应单独低频验证。
 
 [MIT License](LICENSE)，Copyright (c) 2026 YG。

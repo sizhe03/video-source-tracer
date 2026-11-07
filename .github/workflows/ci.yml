@@ -1,0 +1,50 @@
+name: Offline checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-tests:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.10', '3.12']
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install Python dependencies in the runner
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt "yt-dlp[default]"
+          python -m pip check
+      - name: Show runtime and dependency versions
+        run: |
+          python --version
+          python -m pip freeze
+          python -m yt_dlp --version
+      - name: CLI help and version (no live video requests)
+        run: |
+          python scripts/trace.py --help
+          python scripts/trace.py --version
+      - name: Run offline regressions and CLI subprocess checks
+        run: python tests/run_all.py
+
+# Regression fixtures use synthetic media and mocked network interfaces.
+# This does not validate live platforms, agent Skill loading, downloads or
+# a system FFmpeg installation. Do not report matrix success until CI ran.
