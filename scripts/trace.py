@@ -17,11 +17,13 @@ account, and merging the two produced the wrong answer once already.
 Usage:
     python trace.py BV1rCxf6MERM
     python trace.py BV1rCxf6MERM --budget 90 --max-requests 120
-    python trace.py BV1rCxf6MERM --routes view,space,related,search
+    python trace.py BV1rCxf6MERM --json
 """
 from __future__ import annotations
 
+import argparse
 import json
+import math
 import queue
 import re
 import sys
@@ -35,6 +37,7 @@ from _common import note, setup_stdio
 
 # ---------------------------------------------------------------- constants
 KEY_VERSION = 1
+VERSION = "1.0.0"
 
 # Per-host pacing. These are starting intervals, not locks: several requests to
 # the same host may be in flight, they just may not START closer than this.
@@ -1917,6 +1920,14 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
         level = "strong_lead"
     return {
         "name": top["name"], "level": level,
+        # Display-only count: evidence groups above may count works, not
+        # accounts. Unknown uploader identities must not inflate this number.
+        "corroborating_accounts": (
+            len({c["uploader"] for c in (explicit_credits or [])
+                 if c["name"] == top["name"] and c.get("uploader")})
+            if top["source"] == "repost_credit" else
+            top["independent_evidence_groups"] if top["source"] == "titles"
+            else 0 if level == "guess" else None),
         "witness": wit,
         "signature_work_id": (top.get("work_id")),
         "witness_work_id": (wit or {}).get("witness_work_id"),
@@ -1929,43 +1940,88 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
     }
 
 
+def format_summary(out: dict) -> str:
+    """Render the two independent conclusions without upgrading attribution."""
+    def text(value, fallback="未知"):
+        # Remote titles/names may contain line breaks or terminal controls.
+        value = " ".join(str(value if value is not None else "").split())
+        return "".join(c for c in value if c.isprintable()) or fallback
+
+    item = out.get("input") or {}
+    earliest = out.get("earliest_known") or {}
+    creator = out.get("creator_conclusion") or {}
+    level = creator.get("level", "unconfirmed")
+    labels = {"strong_lead": "较强线索", "weak_lead": "较弱线索，署名尚未充分印证",
+              "guess": "仅评论猜测", "unconfirmed": "未找到作者线索"}
+    notes = {
+        "strong_lead": "归属为高可能性线索，需人工打开频道确认",
+        "weak_lead": "署名证据不足，需更多独立来源并人工打开频道核对",
+        "guess": "名字仅来自猜测，不能据此认定作者，需人工核实",
+        "unconfirmed": "现有证据不足以判断作者，未找到不代表没有原作者",
+    }
+    accounts = creator.get("corroborating_accounts")
+    if accounts is None and level in ("guess", "unconfirmed"):
+        accounts = 0
+    count = f"{accounts} 个账号印证" if accounts is not None else "印证账号数未知"
+    lines = [f"输入    : {text(item.get('id'))}  {text(item.get('title'), '标题未知')}"]
+    if earliest.get("work_id"):
+        delta = earliest.get("delta_days")
+        gap = f"早 {delta:.2f} 天" if delta is not None else "时间差未知"
+        lines.append(f"原视频  : {text(earliest['work_id'])}  {gap}（目前找到的最早副本）")
+        if earliest.get("title"):
+            lines.append(f"          {text(earliest['title'])}")
+    else:
+        lines.append("原视频  : 未找到更早副本")
+    lines.append(f"原作者  : {text(creator.get('name'), '未知')}  "
+                 f"（{labels.get(level, labels['unconfirmed'])} / {text(level)}，{count}）")
+    ids = (creator.get("ids") or {}).get("youtube_channel") or []
+    lines.append("作者 ID : " + ("、".join(text(cid) for cid in ids) if ids else "未找到频道 ID 线索"))
+    witness = creator.get("witness") or {}
+    size = witness.get("catalogue_size")
+    lines.append(f"见证作品: {size} 条（目录证据，归属待人工确认）"
+                 if size is not None else "见证作品: 未找到可用目录")
+    links = earliest.get("original_links") or []
+    if links:
+        lines.append("原始链接: " + "  ".join(
+            text(link) if str(link).startswith("https://")
+            else "https://www.youtube.com/watch?v=" + text(link) for link in links))
+    lines.append("说明    : " + notes.get(level, notes["unconfirmed"]))
+    if out.get("coverage_incomplete"):
+        lines.append("提示    : 部分通道被限流，结果可能不完整")
+    return "\n".join(lines)
+
+
+def cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="查找 B 站视频的更早副本、原作者线索和作者频道 ID。归属需人工确认。",
+        epilog="示例：\n  python scripts/trace.py BV1rCxf6MERM\n"
+               "  python scripts/trace.py https://www.bilibili.com/video/BV1rCxf6MERM --json\n"
+               "默认输出 10 行以内的中文摘要；--json 输出完整证据和原始候选。",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("target", metavar="视频", help="B 站视频 BV 号或包含 BV 号的完整链接")
+    parser.add_argument("--json", action="store_true", help="输出完整 JSON，供程序处理或检查证据")
+    parser.add_argument("--budget", type=float, default=90, metavar="秒",
+                        help="搜索时间预算，默认 90 秒；不含初始视频读取，收尾可能超时")
+    parser.add_argument("--max-requests", type=int, default=120, metavar="次数",
+                        help="搜索请求预算，默认 120；不含初始视频读取")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}",
+                        help="显示版本号并退出")
+    return parser
+
+
 def main(argv: list[str]) -> int:
     setup_stdio()
-    if not argv:
-        print(__doc__)
-        return 2
-    def _val(flag, default):
-        if flag in argv:
-            i = argv.index(flag)
-            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
-                return argv[i + 1]
-        return default
-
-    # Flags must be consumed as VALUES, not mistaken for the video id.
-    skip = set()
-    for flag in ("--budget", "--max-requests", "--routes"):
-        if flag in argv:
-            i = argv.index(flag)
-            skip.add(i)
-            if i + 1 < len(argv):
-                skip.add(i + 1)
-    positional = [a for i, a in enumerate(argv)
-                  if i not in skip and not a.startswith("--")]
-    target = positional[0] if positional else None
-    if not target:
-        print(__doc__)
-        return 2
-    try:
-        budget_s = float(_val("--budget", "90"))
-        max_requests = int(_val("--max-requests", "120"))
-    except ValueError as e:
-        raise SystemExit(f"invalid numeric flag: {e}")
-
+    parser = cli_parser()
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.budget) or args.budget <= 0:
+        parser.error("--budget 必须是大于 0 的有限秒数")
+    if args.max_requests <= 0:
+        parser.error("--max-requests 必须大于 0")
     from trace_net import live_net
-    item = live_net().probe(target)
+    item = live_net().probe(args.target)
     out = run(item, net=live_net().channels(),
-              budget_s=budget_s, max_requests=max_requests)
-    print(json.dumps(out, ensure_ascii=False, indent=1))
+              budget_s=args.budget, max_requests=args.max_requests)
+    print(json.dumps(out, ensure_ascii=False, indent=1) if args.json else format_summary(out))
     return 0
 
 

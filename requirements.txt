@@ -1,0 +1,4 @@
+# Also install the external ffmpeg and yt-dlp commands and put them on PATH.
+# They are system/CLI dependencies, not installed by this requirements file.
+numpy
+opencv-python-headless

@@ -16,9 +16,13 @@ version of this file asserted exactly that and was wrong.
 from __future__ import annotations
 
 import json
+import copy
+import io
 import sys
 import time
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
+from unittest.mock import patch, Mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "scripts"))
@@ -405,11 +409,11 @@ check("no-genre catalogue yields no attributed id",
       not _c_genre["ids"]["youtube_channel"], str(_c_genre["ids"]))
 
 # 4. main() consumes --budget / --max-requests instead of treating 5 as a bvid
-# (inspect the source contract; actually running main() would hit the network)
+# Parse real arguments without touching the network.
 _tr_src = (HERE.parent / "scripts" / "trace.py").read_text(encoding="utf-8")
+_args = T.cli_parser().parse_args(["--budget", "5", "--max-requests", "8", ITEM["id"]])
 check("main parses --budget and --max-requests",
-      'budget_s = float(_val("--budget"' in _tr_src
-      and 'max_requests = int(_val("--max-requests"' in _tr_src,
+      _args.budget == 5 and _args.max_requests == 8 and _args.target == ITEM["id"],
       "documented flags must not be ignored")
 
 print()
@@ -763,6 +767,89 @@ _d22 = T.diagnosis({"work_id": "BVx"},
                    {"name": "Evil", "level": "weak_lead"}, [], 10, 1)
 check("an uncorroborated credit is not complete",
       _d22["stage"] != "complete", str(_d22))
+
+print()
+print("-- CLI summary and output contract ---------------------------")
+_report = {
+    "ok": True, "input": ITEM,
+    "earliest_known": {"work_id": "BV1wGao65EnF", "delta_days": 35.49,
+                       "title": ITEM["title"], "original_links": ["abcdefghijk"]},
+    "creator_conclusion": {"name": "POMEchan", "level": "strong_lead",
+                           "corroborating_accounts": 41,
+                           "ids": {"youtube_channel": ["UC1Y-RkDrol_nyXk7vx8wgUA"]},
+                           "witness": {"catalogue_size": 239}},
+    "coverage_incomplete": True, "candidates": [{"raw": "保留原始候选"}] * 187,
+}
+_before = copy.deepcopy(_report)
+_summary = T.format_summary(_report)
+check("summary shows title, earlier id and delta",
+      ITEM["title"] in _summary and "BV1wGao65EnF  早 35.49 天" in _summary)
+check("summary shows creator level and account count",
+      "POMEchan" in _summary and "strong_lead，41 个账号印证" in _summary)
+check("summary shows channel id and witness count",
+      "UC1Y-RkDrol_nyXk7vx8wgUA" in _summary and "见证作品: 239 条" in _summary)
+check("summary keeps attribution provisional",
+      "归属为高可能性线索，需人工打开频道确认" in _summary and "已核实归属" not in _summary)
+check("summary renders original YouTube link", "https://www.youtube.com/watch?v=abcdefghijk" in _summary)
+check("coverage warning is last", _summary.endswith("部分通道被限流，结果可能不完整"))
+check("full summary is at most ten lines", len(_summary.splitlines()) <= 10)
+check("summary leaves full report untouched", _report == _before)
+for _level, _phrase in [("weak_lead", "署名证据不足"), ("guess", "名字仅来自猜测"),
+                        ("unconfirmed", "现有证据不足以判断作者")]:
+    _variant = copy.deepcopy(_report)
+    _variant["creator_conclusion"] = {"name": "候选" if _level != "unconfirmed" else None, "level": _level}
+    _variant["earliest_known"] = {}
+    _variant["coverage_incomplete"] = False
+    _rendered = T.format_summary(_variant)
+    check(f"{_level} has distinct honest wording", _phrase in _rendered and "高可能性" not in _rendered)
+    check(f"{_level} handles missing evidence", "未找到更早副本" in _rendered
+          and "未找到频道 ID 线索" in _rendered and "未找到可用目录" in _rendered
+          and "部分通道" not in _rendered and "原始链接" not in _rendered)
+_variant = copy.deepcopy(_report)
+_variant["input"]["title"] = "多行\n标题\r\n含\x1b控制符"
+_variant["creator_conclusion"]["name"] = "名字\n换行"
+_variant["earliest_known"]["delta_days"] = None
+_variant["earliest_known"]["original_links"] = ["https://youtu.be/abcdefghijk", "ZYXWVUTSRQP"]
+_rendered = T.format_summary(_variant)
+check("remote newlines cannot expand summary", len(_rendered.splitlines()) <= 10 and "\x1b" not in _rendered)
+check("unknown delta is not zero days", "时间差未知" in _rendered and "早 0.00 天" not in _rendered)
+check("multiple original links preserved", "https://youtu.be/abcdefghijk" in _rendered and "watch?v=ZYXWVUTSRQP" in _rendered)
+check("same uploader counts once in display", _c_same["corroborating_accounts"] == 1)
+check("distinct uploaders counted in display", _c_diff["corroborating_accounts"] == 2)
+check("missing uploader is not a known account", _c20["corroborating_accounts"] == 0)
+
+def _invoke_cli(argv):
+    stdout, stderr = io.StringIO(), io.StringIO()
+    network = Mock()
+    network.probe.return_value = ITEM
+    network.channels.return_value = {}
+    with patch.object(T, "setup_stdio"), patch("trace_net.live_net", return_value=network), \
+            patch.object(T, "run", return_value=_report) as run_mock, \
+            redirect_stdout(stdout), redirect_stderr(stderr):
+        try:
+            status = T.main(argv)
+        except SystemExit as exc:
+            status = exc.code
+    return status, stdout.getvalue(), stderr.getvalue(), network, run_mock
+
+_status, _stdout, _, _network, _run = _invoke_cli(["--budget", "5", ITEM["id"], "--max-requests", "8"])
+check("default CLI prints summary", _status == 0 and _stdout == _summary + "\n")
+check("CLI forwards target and budgets", _network.probe.call_args.args == (ITEM["id"],)
+      and _run.call_args.kwargs == {"net": {}, "budget_s": 5.0, "max_requests": 8})
+_status, _stdout, _, _, _ = _invoke_cli([ITEM["id"], "--json"])
+check("JSON CLI preserves every result field and candidate", _status == 0 and json.loads(_stdout) == _report)
+for _flag in ("--help", "--version"):
+    _status, _stdout, _, _network, _run = _invoke_cli([_flag])
+    check(f"{_flag} exits without network", _status == 0 and not _network.probe.called and not _run.called)
+    check(f"{_flag} describes public interface", ("--json" in _stdout and "discover.py" not in _stdout)
+          if _flag == "--help" else T.VERSION in _stdout)
+for _argv in ([], [ITEM["id"], "--budget"], [ITEM["id"], "--budget", "nan"],
+              [ITEM["id"], "--budget", "inf"], [ITEM["id"], "--budget", "0"],
+              [ITEM["id"], "--max-requests", "-1"], [ITEM["id"], "--max-requests", "1.5"],
+              [ITEM["id"], "--unknown"]):
+    _status, _, _stderr, _network, _run = _invoke_cli(_argv)
+    check(f"invalid CLI args fail before network: {_argv}",
+          _status == 2 and bool(_stderr) and not _network.probe.called and not _run.called)
 
 print()
 bad = [n for n, c in R if not c]
