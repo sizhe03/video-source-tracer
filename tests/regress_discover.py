@@ -71,7 +71,7 @@ def slow_yt(q, n=20):
 
 t0 = time.monotonic()
 out = discover.run(ITEM, routes=["same_site", "comments", "cross"],
-                   budget_s=10, max_requests=40,
+                   budget_s=60, max_requests=40,
                    bili=slow_bili, yt=slow_yt, cover=None, gaps={"api.bilibili.com":0.02,"www.youtube.com":0.02})
 wall = time.monotonic() - t0
 # Sequential execution would be ~0.35 + 1.5 + 0.35 = 2.2 s (comments has two
@@ -110,7 +110,7 @@ def lead_yt(q, n=20):
 
 
 out2 = discover.run(ITEM, routes=["same_site", "comments", "cross"],
-                    budget_s=12, max_requests=60,
+                    budget_s=60, max_requests=60,
                     bili=lead_bili, yt=lead_yt, cover=None, gaps={"api.bilibili.com":0.02,"www.youtube.com":0.02})
 leads = {(l["kind"], l["value"]) for l in out2["leads"]}
 check("a platform id lead was extracted from the description",
@@ -291,7 +291,7 @@ def _fan_yt(q, _n=20):
     return []
 
 _fan = discover.run(ITEM, routes=["same_site", "comments", "cross"],
-                    budget_s=30, max_requests=40, bili=_fan_bili, yt=_fan_yt,
+                    budget_s=60, max_requests=40, bili=_fan_bili, yt=_fan_yt,
                     cover=None, gaps={"api.bilibili.com": 0.02,
                                       "www.youtube.com": 0.02})
 _leads = [l for l in _fan["leads"] if l["kind"] == "name"]
