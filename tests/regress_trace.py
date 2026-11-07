@@ -91,6 +91,13 @@ def _mk_pool():
                      "title": "【POMEchan ASMR】大腿精油按摩 %d" % i,
                      "author": "搬运三号",
                      "pubdate": 1793835738 - i * 86400, "length": "34:00"})
+    # An earlier, same-title copy from a DIFFERENT mid. The sibling-space and
+    # earlier-view dispatches are now gated on pubdate + _same_subject, so the
+    # fixture needs one such row for those assertions to exercise them.
+    rows.append({"bvid": "BVEARLIER0001",
+                 "title": ITEM["title"], "author": "搬运四号",
+                 "mid": 99990001,
+                 "pubdate": ITEM["pubdate"] - 35 * 86400, "length": "33:09"})
     return rows
 
 
@@ -183,9 +190,12 @@ if brand_q:
     check("dispatched within 0.3 s of the producer",
           brand_q[0][0] - space_end < 0.3,
           f"lag={brand_q[0][0] - space_end:.3f}s")
-check("the brand also triggered a same-site search",
-      any(k == "search" and q and "pomechan" in q.lower() for k, _, q in CALLS),
-      str([q for k, _, q in CALLS if k == "search"]))
+_brand_searched = any(
+    q and "pomechan" in q.lower()
+    for k, _, q in CALLS if k in ("ytsearch", "web", "search"))
+check("the brand triggered a follow-up search",
+      _brand_searched,
+      str([q for k, _, q in CALLS if k in ("ytsearch", "web", "search")]))
 check("both orders are queried, not just relevance",
       sum(1 for k, _, q in CALLS if k == "search") >= 2,
       "pubdate and click are different result sets")
@@ -656,16 +666,19 @@ check("a youtube watch link is extracted",
       == ["A0kPGKoqJRo"])
 
 # explicit credit outranks derived brands and yields a strong lead
-_c20 = T.creator_conclusion(
-    _brands,
-    [{"platform": "bilibili", "id": "BV1xpHq6BEDR", "title": _title20}],
-    [], [], [{"name": "Kirin Camp", "work_id": "BV1xpHq6BEDR",
-              "source": "repost_credit"}])
-check("explicit credit becomes the top creator",
+_one20 = [{"name": "Kirin Camp", "work_id": "BV1xpHq6BEDR",
+           "source": "repost_credit"}]
+_two20 = _one20 + [{"name": "Kirin Camp", "work_id": "BV1SECOND000",
+                    "source": "repost_credit"}]
+_c20 = T.creator_conclusion(_brands, [], [], [], _two20)
+check("a credit corroborated by two works is a strong lead",
       _c20["name"] == "Kirin Camp" and _c20["level"] == "strong_lead",
       str((_c20["name"], _c20["level"])))
-check("signature_work_id records where the credit was written",
-      _c20["signature_work_id"] == "BV1xpHq6BEDR",
+_c21 = T.creator_conclusion(_brands, [], [], [], _one20)
+check("a single unverified credit stays a weak lead",
+      _c21["level"] == "weak_lead", str(_c21["level"]))
+check("signature_work_id records one of the crediting works",
+      _c20["signature_work_id"] in ("BV1xpHq6BEDR", "BV1SECOND000"),
       str(_c20["signature_work_id"]))
 
 # an unrelated older video must NOT contribute a credit

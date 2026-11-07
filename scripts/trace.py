@@ -401,10 +401,19 @@ class Pool:
                     task.result.candidates or task.result.evidence):
                 self.failures.pop(task.kind, None)
                 self.tripped.discard(task.kind)
-            # Drop already-queued tasks of a tripped kind.
+            # Drop already-queued tasks of a tripped kind, but mark them
+            # terminal. Leaving them READY made _all_done() false forever and
+            # workers spun until the budget expired.
             if self.tripped:
-                self.ready = [t for t in self.ready
-                              if t.kind not in self.tripped]
+                keep = []
+                for t in self.ready:
+                    if t.kind in self.tripped:
+                        t.state = "SKIPPED"
+                        t.reason = "circuit breaker tripped"
+                        self.done += 1
+                    else:
+                        keep.append(t)
+                self.ready = keep
             self.cv.notify_all()
 
     def stop(self, reason: str) -> None:
@@ -433,6 +442,13 @@ class Ctx:
         # available and were previously discarded.
         self.explicit_credits: list[dict] = []
         self.original_links: list[str] = []
+        # Hard caps on the two per-row dispatch paths. Brand fan-out had a cap;
+        # these two new paths did not, and a 95-row search exhausted the
+        # entire task budget with unrelated accounts.
+        self.sibling_dispatched: int = 0
+        self.max_sibling_space: int = 6
+        self.earlier_dispatched: int = 0
+        self.max_earlier_view: int = 6
         # A broad title search can yield dozens of generic latin tokens. Each
         # brand expansion spawns 5 tasks, so cap the total per run.
         self.brand_expansions: int = 0
@@ -461,13 +477,17 @@ class Ctx:
     def note_credit(self, name: str, work_id: str | None,
                     source: str = "title") -> None:
         with self._blocked_lock:
-            if not any(c["name"] == name for c in self.explicit_credits):
+            # One entry PER WORK, not one per name: corroboration is measured
+            # by how many distinct works credit the same person.
+            if work_id and not any(
+                    c["name"] == name and c["work_id"] == work_id
+                    for c in self.explicit_credits):
                 self.explicit_credits.append(
                     {"name": name, "work_id": work_id, "source": source})
 
-    def note_original(self, vid: str) -> None:
+    def note_original(self, vid: str, work_id: str | None = None) -> None:
         with self._blocked_lock:
-            if vid not in self.original_links:
+            if vid not in self.original_links and work_id:
                 self.original_links.append(vid)
 
     def note_identity(self, value: str, source: str = "") -> None:
@@ -511,8 +531,7 @@ def _strip_tags(s: str) -> str:
 def run_view(task: Task, ctx: Ctx) -> TaskResult:
     j = ctx.net["view"](task.params["bvid"])
     if j.get("code") != 0:
-        ctx.note_blocked("view", f"code {j.get('code')}")
-        return TaskResult(note=f"view code {j.get('code')}")
+        raise RuntimeError(f"bili.view code {j.get('code')}")
     d = j.get("data") or {}
     bvid = d.get("bvid")
     title = _strip_tags(d.get("title") or "")
@@ -522,12 +541,14 @@ def run_view(task: Task, ctx: Ctx) -> TaskResult:
     # string used for chronological sorting. But ONLY for a work that is
     # plausibly the same subject -- otherwise an unrelated view's "作者：X"
     # pollutes the creator candidates.
-    if _same_subject({"title": title, "duration": d.get("duration") or 0},
-                     ctx.item, []):
+    if (bvid != ctx.item.get("id")
+            and _same_subject(
+                {"title": title, "duration": d.get("duration") or 0},
+                ctx.item, [])):
         for name in explicit_credits(title + " " + desc):
             ctx.note_credit(name, bvid, "repost_credit")
         for vid in original_links(desc):
-            ctx.note_original(vid)
+            ctx.note_original(vid, bvid)
     out = TaskResult(candidates=[{
         "platform": "bilibili", "id": bvid,
         "title": title,
@@ -627,8 +648,7 @@ def run_timeline(task: Task, ctx: Ctx) -> TaskResult:
 def run_related(task: Task, ctx: Ctx) -> TaskResult:
     j = ctx.net["related"](task.params["bvid"])
     if j.get("code") != 0:
-        ctx.note_blocked("related", f"code {j.get('code')}")
-        return TaskResult(note=f"related code {j.get('code')}")
+        raise RuntimeError(f"bili.related code {j.get('code')}")
     cands = []
     for v in (j.get("data") or []):
         cands.append({
@@ -641,11 +661,15 @@ def run_related(task: Task, ctx: Ctx) -> TaskResult:
     # Measured precision is 2.6%: 39 neighbours, 1 real copy. Reading titles for
     # a brand is free; treating them as candidates or recursing into them is
     # not, so this runner deliberately spawns nothing.
-    leads = []
+    # One lead PER TOKEN, not per title. A brand repeated across 39 neighbour
+    # titles used to emit 6+ identical leads, each consuming one of the six
+    # brand-expansion slots, so the actual search never got dispatched.
+    counts: dict[str, int] = {}
     for v in (j.get("data") or []):
         for b in brand_tokens(_strip_tags(v.get("title") or "")):
-            leads.append({"kind": "brand", "value": b, "count": 1,
-                          "source": "related"})
+            counts[b] = counts.get(b, 0) + 1
+    leads = [{"kind": "brand", "value": b, "count": n, "source": "related"}
+             for b, n in counts.items()]
     return TaskResult(candidates=cands, leads=leads)
 
 
@@ -666,12 +690,15 @@ def run_search(task: Task, ctx: Ctx) -> TaskResult:
             "cover": r.get("pic"),
             "mid": r.get("mid"),
         })
-        # A repost ring shares the same source. If the input account's space
-        # is risk-controlled (-401), a discovered sibling's timeline often
-        # still carries the original creator's name. Dispatch immediately.
+        # A repost ring shares the same source, but only a FEW siblings are
+        # worth a whole timeline request. Gate on the same-subject + earlier
+        # test and a hard per-run cap; otherwise a broad search with 95
+        # different mids exhausts the entire task budget.
         smid = r.get("mid")
-        if (smid and str(smid) != str(ctx.item.get("mid"))
-                and ctx.item.get("platform") == "bilibili"):
+        if (same_work and smid and str(smid) != str(ctx.item.get("mid"))
+                and ctx.item.get("platform") == "bilibili"
+                and ctx.sibling_dispatched < ctx.max_sibling_space):
+            ctx.sibling_dispatched += 1
             ctx.pool.spawn(Task.make(
                 "bili.space", parent=task,
                 origin={"src": task.id, "kind": "sibling_account",
@@ -683,17 +710,24 @@ def run_search(task: Task, ctx: Ctx) -> TaskResult:
         # may contribute a credit or a description probe. Without this gate a
         # date-sorted search spawned ~80 views and harvested "作者：X" from
         # dozens of unrelated videos.
-        same_work = bool(
-            pub and inp and pub < inp
-            and _same_subject(
-                {"title": title, "duration": _secs(r.get("duration"))},
-                ctx.item, []))
-        if same_work:
+        subj_ok = _same_subject(
+            {"title": title, "duration": _secs(r.get("duration"))},
+            ctx.item, [])
+        same_work = bool(pub and inp and pub < inp and subj_ok)
+        # Credits only need subject agreement, not an earlier date: two
+        # reposts of the same work may both be later than the input yet both
+        # name the original creator. Corroboration (>=2 works) is the guard
+        # against a single forged line, not the pubdate comparison.
+        if subj_ok:
             for name in explicit_credits(title):
                 ctx.note_credit(name, r.get("bvid"), "search_title")
-            if r.get("bvid") and r.get("bvid") != ctx.item.get("id"):
+            if (r.get("bvid") and r.get("bvid") != ctx.item.get("id")
+                    and ctx.earlier_dispatched < ctx.max_earlier_view):
                 # Its description often carries "作者：X" plus the original
-                # YouTube link, which search results omit. Instant dispatch.
+                # YouTube link, which search results omit. Instant dispatch,
+                # but capped: a date-sorted search can return dozens of
+                # same-title copies.
+                ctx.earlier_dispatched += 1
                 ctx.pool.spawn(Task.make(
                     "bili.view", parent=task,
                     origin={"src": task.id, "kind": "earlier_copy",
@@ -1028,6 +1062,13 @@ _NOT_A_BRAND |= {
     "sounds", "sound", "video", "reupload", "upload", "credit", "credits",
     "original", "originalvideo", "subscribe", "channel", "official",
     "democrats", "republican", "news", "live", "stream", "highlights",
+    # scene / genre descriptors, not creators. Measured on BV1Xpxf6QEqk:
+    # "camp" appeared under 9 accounts and outranked the real creator.
+    "camp", "camping", "campsite", "campground", "tent", "trailer", "caravan",
+    "rain", "rainy", "raining", "heavy", "shelter", "nature", "forest",
+    "outdoor", "outdoors", "travel", "trip", "tour", "days", "night", "nights",
+    "tried", "relaxing", "cozy", "pink", "luxury", "beautiful", "sound",
+    "sounds", "white", "noise", "healing", "sleeping", "tapping", "scratch",
 }
 
 
@@ -1320,6 +1361,7 @@ def brand_consensus(cands: list[dict]) -> list[dict]:
     """
     per: dict[str, set] = {}
     plats: dict[str, set] = {}
+    proper: dict[str, int] = {}
     for c in cands:
         # Some bilibili endpoints (recArchivesByKeywords) omit the author but
         # do carry mid. Without this fallback all such rows collapse into one
@@ -1329,17 +1371,28 @@ def brand_consensus(cands: list[dict]) -> list[dict]:
         if not who and c.get("mid"):
             who = f"mid:{c['mid']}"
         plat = c.get("platform") or "?"
-        for b in brand_tokens(c.get("title") or ""):
-            per.setdefault(b.lower(), set()).add(who)
-            plats.setdefault(b.lower(), set()).add(plat)
+        title = c.get("title") or ""
+        for b in brand_tokens(title):
+            key = b.lower()
+            per.setdefault(key, set()).add(who)
+            plats.setdefault(key, set()).add(plat)
+            # A capitalised token ("Kirin", "POMEchan") is a plausible handle;
+            # a lowercase one ("camp", "world") is usually a common noun.
+            if b[:1].isupper():
+                proper[key] = proper.get(key, 0) + 1
     rows = []
     for b, a in per.items():
         if len(a) < 2:
             continue
         rows.append({"brand": b, "accounts": len(a),
                      "platforms": sorted(plats.get(b, set())),
+                     "proper_hits": proper.get(b, 0),
                      "sample": sorted(a)[:4]})
-    return sorted(rows, key=lambda d: (-len(d["platforms"]), -d["accounts"]))
+    # Proper-name signal first: it separates a creator handle from a genre
+    # word that happens to be repeated by every reposter in the ring.
+    return sorted(rows, key=lambda d: (-d["proper_hits"],
+                                       -len(d["platforms"]),
+                                       -d["accounts"]))
 
 
 def _rank_key(c: dict):
@@ -1720,11 +1773,25 @@ def creator_conclusion(brands: list[dict], cands: list[dict],
     # earlier copy's title and description both credited Kirin Camp, but the
     # engine returned unconfirmed because only comments and repeated Latin
     # tokens were consulted.
+    # Corroboration: a single "作者：X" written by one reposter is a lead,
+    # not an answer -- any uploader can write any name in their own title.
+    # Only when two DIFFERENT works independently credit the same name does
+    # it become a strong lead. Measured attack: one forged earlier copy with
+    # "作者：Evil" + a fake youtu.be link produced Evil/strong_lead/complete.
+    credit_works: dict[str, set] = {}
     for c in (explicit_credits or []):
-        candidates.append({"name": c["name"], "level": "strong_lead",
-                           "source": "repost_credit",
-                           "work_id": c.get("work_id"), "hedged": False,
-                           "independent_evidence_groups": 1})
+        credit_works.setdefault(c["name"], set()).add(c.get("work_id") or "?")
+    for name, works in credit_works.items():
+        n = len([w for w in works if w != "?"])
+        candidates.append({
+            "name": name,
+            "level": "strong_lead" if n >= 2 else "weak_lead",
+            "source": "repost_credit",
+            "work_id": sorted(w for w in works if w != "?")[0]
+                       if any(w != "?" for w in works) else None,
+            "hedged": False,
+            "independent_evidence_groups": max(1, n),
+        })
 
     # A confident statement in the thread outranks derived signals; a hedged
     # one does not. "桑塔阿普亚，应该是这个" is a guess and belongs below a brand
